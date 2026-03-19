@@ -5,6 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider } from "@/contexts/auth-context";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 import LoginPage from "@/pages/login";
 import UserDashboard from "@/pages/user-dashboard";
 import JoinQueuePage from "@/pages/join-queue";
@@ -31,6 +32,7 @@ function App() {
       <TooltipProvider>
         <AuthProvider>
           <Toaster />
+          <SpeedInsights />
           <Router hook={useHashLocation}>
             <AppRouter />
           </Router>
