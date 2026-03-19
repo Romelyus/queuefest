@@ -15,7 +15,26 @@ npm run dev
 
 ## Production-развертывание
 
-### Вариант 1: Docker (рекомендуется)
+### Вариант 1: Vercel (быстрый запуск)
+
+Один клик — и приложение работает:
+
+1. Перейдите на [vercel.com/new](https://vercel.com/new)
+2. Нажмите **Import Git Repository** → выберите `Romelyus/queuefest`
+3. Vercel автоматически определит настройки из `vercel.json`:
+   - Build Command: `npm run build:client`
+   - Output Directory: `dist/public`
+   - Serverless Function: `api/index.ts`
+4. Нажмите **Deploy**
+
+После деплоя:
+- Сайт доступен на `queuefest-xxx.vercel.app`
+- CI/CD: каждый push в `main` автоматически деплоит новую версию
+- Preview: каждый PR создает превью-деплой
+
+> **Ограничения Vercel:** WebSocket не поддерживается в serverless — приложение автоматически использует polling (обновление каждые 3-10 сек). In-memory storage сбрасывается при cold start. Для фестивалей с постоянной нагрузкой лучше VPS с Docker (вариант 2).
+
+### Вариант 2: Docker (рекомендуется для продакшена)
 
 Создайте файл `Dockerfile`:
 
