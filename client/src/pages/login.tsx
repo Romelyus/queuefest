@@ -6,10 +6,11 @@ import type { Event } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Dice5, Shield, Users } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Dice5, Shield, Users, AlertCircle } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
 
 export default function LoginPage() {
   const { login, adminLogin } = useAuth();
@@ -17,21 +18,25 @@ export default function LoginPage() {
   const { toast } = useToast();
   const [braceletId, setBraceletId] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
-  const [selectedEvent, setSelectedEvent] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const { data: events = [] } = useQuery<Event[]>({
+  // Fetch the single active event
+  const { data: activeEvent } = useQuery<Event | null>({
     queryKey: ["/api/events/active"],
   });
 
   const handleUserLogin = async () => {
-    if (!braceletId || !selectedEvent) {
-      toast({ title: "Ошибка", description: "Выберите событие и введите номер браслета", variant: "destructive" });
+    if (!braceletId) {
+      toast({ title: "Ошибка", description: "Введите номер браслета", variant: "destructive" });
+      return;
+    }
+    if (!activeEvent) {
+      toast({ title: "Ошибка", description: "Нет активного события. Обратитесь к администратору.", variant: "destructive" });
       return;
     }
     setLoading(true);
     try {
-      await login(braceletId, selectedEvent);
+      await login(braceletId, activeEvent.id);
       navigate("/dashboard");
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
@@ -47,7 +52,7 @@ export default function LoginPage() {
     }
     setLoading(true);
     try {
-      const user = await adminLogin(adminPassword, selectedEvent || undefined);
+      const user = await adminLogin(adminPassword);
       if (user.role === "admin") {
         navigate("/admin");
       } else {
@@ -69,6 +74,11 @@ export default function LoginPage() {
           </div>
           <h1 className="text-xl font-bold tracking-tight" data-testid="text-app-title">QueueFest</h1>
           <p className="text-sm text-muted-foreground">Система очередей фестиваля настольных игр</p>
+          {activeEvent && (
+            <Badge variant="outline" className="text-xs">
+              {activeEvent.name}
+            </Badge>
+          )}
         </div>
 
         <Tabs defaultValue="user" className="w-full">
@@ -88,17 +98,11 @@ export default function LoginPage() {
                 <CardDescription>Введите номер с вашего браслета</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                {events.length > 0 && (
-                  <Select value={selectedEvent} onValueChange={setSelectedEvent}>
-                    <SelectTrigger data-testid="select-event">
-                      <SelectValue placeholder="Выберите фестиваль" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {events.map((e) => (
-                        <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                {!activeEvent && (
+                  <div className="flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 p-3 rounded-lg">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <span>Нет активного события. Обратитесь к администратору.</span>
+                  </div>
                 )}
                 <Input
                   data-testid="input-bracelet"
@@ -115,7 +119,7 @@ export default function LoginPage() {
                   data-testid="button-login"
                   className="w-full"
                   onClick={handleUserLogin}
-                  disabled={loading || !braceletId}
+                  disabled={loading || !braceletId || !activeEvent}
                 >
                   {loading ? "Вход..." : "Войти"}
                 </Button>
@@ -130,18 +134,6 @@ export default function LoginPage() {
                 <CardDescription>Администратор или менеджер</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                {events.length > 0 && (
-                  <Select value={selectedEvent} onValueChange={setSelectedEvent}>
-                    <SelectTrigger data-testid="select-event-admin">
-                      <SelectValue placeholder="Выберите фестиваль (опционально)" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {events.map((e) => (
-                        <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
                 <Input
                   data-testid="input-admin-password"
                   type="password"

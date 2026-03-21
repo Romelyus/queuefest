@@ -1,6 +1,6 @@
+import { useEffect } from "react";
 import { Switch, Route, Router } from "wouter";
-import { useHashLocation } from "wouter/use-hash-location";
-import { queryClient } from "./lib/queryClient";
+import { queryClient, apiRequest } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -26,14 +26,25 @@ function AppRouter() {
   );
 }
 
+// Keep-alive: ping the backend every 5 minutes to prevent Vercel cold starts
+function useKeepAlive() {
+  useEffect(() => {
+    const interval = setInterval(() => {
+      apiRequest("GET", "/api/health").catch(() => {});
+    }, 5 * 60 * 1000); // every 5 minutes
+    return () => clearInterval(interval);
+  }, []);
+}
+
 function App() {
+  useKeepAlive();
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <AuthProvider>
           <Toaster />
           <SpeedInsights />
-          <Router hook={useHashLocation}>
+          <Router>
             <AppRouter />
           </Router>
         </AuthProvider>

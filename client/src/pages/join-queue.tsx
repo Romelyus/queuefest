@@ -3,14 +3,12 @@ import { useParams, useLocation } from "wouter";
 import { useAuth } from "@/contexts/auth-context";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
-import type { GameTable, QueueEntry } from "@shared/schema";
+import type { GameTable, QueueEntry, Event } from "@shared/schema";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { Event } from "@shared/schema";
-import { Clock, Users, ListOrdered, CheckCircle2, ArrowLeft, Dice5 } from "lucide-react";
+import { Clock, Users, ListOrdered, CheckCircle2, ArrowLeft, Dice5, AlertCircle } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 type TableWithQueue = GameTable & { queueLength: number; queue: QueueEntry[] };
@@ -22,11 +20,11 @@ export default function JoinQueuePage() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const [braceletId, setBraceletId] = useState("");
-  const [selectedEvent, setSelectedEvent] = useState("");
   const [joining, setJoining] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
 
-  const { data: events = [] } = useQuery<Event[]>({
+  // Fetch active event
+  const { data: activeEvent } = useQuery<Event | null>({
     queryKey: ["/api/events/active"],
   });
 
@@ -40,21 +38,18 @@ export default function JoinQueuePage() {
     refetchInterval: 5000,
   });
 
-  // If only one event, auto-select it
-  useEffect(() => {
-    if (events.length === 1 && !selectedEvent) {
-      setSelectedEvent(events[0].id);
-    }
-  }, [events, selectedEvent]);
-
   const handleLogin = async () => {
-    if (!braceletId || !selectedEvent) {
+    if (!braceletId) {
       toast({ title: "Ошибка", description: "Введите номер браслета", variant: "destructive" });
+      return;
+    }
+    if (!activeEvent) {
+      toast({ title: "Ошибка", description: "Нет активного события", variant: "destructive" });
       return;
     }
     setLoginLoading(true);
     try {
-      await login(braceletId, selectedEvent);
+      await login(braceletId, activeEvent.id);
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
     } finally {
@@ -127,14 +122,6 @@ export default function JoinQueuePage() {
                     <ListOrdered className="w-4 h-4" />
                     <span>Стол: {table.tableName}</span>
                   </div>
-                  <div className="flex items-center gap-1.5">
-                    <Users className="w-4 h-4" />
-                    <span>{table.minPlayers}-{table.maxPlayers} игроков</span>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <Clock className="w-4 h-4" />
-                    <span>~{table.estimatedMinutes} мин</span>
-                  </div>
                 </div>
 
                 <div className="flex items-center gap-2">
@@ -145,12 +132,6 @@ export default function JoinQueuePage() {
                     В очереди: {table.queueLength}
                   </span>
                 </div>
-
-                {table.queueLength > 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    Примерное ожидание: ~{table.queueLength * table.estimatedMinutes} мин
-                  </p>
-                )}
               </CardContent>
             </Card>
 
@@ -161,17 +142,11 @@ export default function JoinQueuePage() {
                   <CardTitle className="text-base">Авторизуйтесь</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  {events.length > 1 && (
-                    <Select value={selectedEvent} onValueChange={setSelectedEvent}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="Фестиваль" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {events.map((e) => (
-                          <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                  {!activeEvent && (
+                    <div className="flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 p-3 rounded-lg">
+                      <AlertCircle className="w-4 h-4 shrink-0" />
+                      <span>Нет активного события</span>
+                    </div>
                   )}
                   <Input
                     data-testid="input-bracelet-join"
@@ -187,7 +162,7 @@ export default function JoinQueuePage() {
                   <Button
                     className="w-full"
                     onClick={handleLogin}
-                    disabled={loginLoading || !braceletId}
+                    disabled={loginLoading || !braceletId || !activeEvent}
                     data-testid="button-login-join"
                   >
                     {loginLoading ? "Вход..." : "Войти и записаться"}

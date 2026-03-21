@@ -19,7 +19,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import {
-  Clock,
   LogOut,
   ListOrdered,
   CheckCircle2,
@@ -262,13 +261,6 @@ export default function UserDashboard() {
                         <div className="flex items-center gap-1 mt-1.5 text-xs text-muted-foreground">
                           <Users className="w-3.5 h-3.5" />
                           <span>Позиция: {q.position}</span>
-                          {q.table?.estimatedMinutes && (
-                            <>
-                              <span className="mx-1">·</span>
-                              <Clock className="w-3.5 h-3.5" />
-                              <span>~{q.position * q.table.estimatedMinutes} мин</span>
-                            </>
-                          )}
                         </div>
                       )}
                       {q.status === "notified" && (

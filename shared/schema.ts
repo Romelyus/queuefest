@@ -37,7 +37,6 @@ export interface Event {
   id: string;
   name: string;
   description: string;
-  date: string; // ISO date
   isActive: boolean;
   createdAt: string;
 }
@@ -47,9 +46,6 @@ export interface GameTable {
   eventId: string;
   tableName: string;
   gameName: string;
-  minPlayers: number;
-  maxPlayers: number;
-  estimatedMinutes: number;
   status: TableStatusType;
   currentSessionStart: string | null;
   qrCode: string; // URL to join queue
@@ -98,7 +94,6 @@ export interface QueueAnalytics {
 export const insertEventSchema = z.object({
   name: z.string().min(1, "Название обязательно"),
   description: z.string().default(""),
-  date: z.string().min(1, "Дата обязательна"),
 });
 
 export type InsertEvent = z.infer<typeof insertEventSchema>;
@@ -107,9 +102,6 @@ export const insertTableSchema = z.object({
   eventId: z.string().min(1),
   tableName: z.string().min(1, "Название стола обязательно"),
   gameName: z.string().min(1, "Название игры обязательно"),
-  minPlayers: z.number().int().min(1).default(2),
-  maxPlayers: z.number().int().min(1).default(6),
-  estimatedMinutes: z.number().int().min(1, "Время партии обязательно"),
 });
 
 export type InsertTable = z.infer<typeof insertTableSchema>;
@@ -119,7 +111,6 @@ export const loginSchema = z.object({
     .string()
     .min(1, "Введите ID браслета")
     .regex(/^\d+$/, "ID должен содержать только цифры"),
-  eventId: z.string().min(1),
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;

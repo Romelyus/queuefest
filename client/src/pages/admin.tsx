@@ -24,6 +24,8 @@ import {
   QrCode,
   Download,
   Dice5,
+  Power,
+  PowerOff,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
@@ -36,9 +38,9 @@ export default function AdminPage() {
   const [selectedEvent, setSelectedEvent] = useState<string>("");
   const [createEventDialog, setCreateEventDialog] = useState(false);
   const [createTableDialog, setCreateTableDialog] = useState(false);
-  const [eventForm, setEventForm] = useState<InsertEvent>({ name: "", description: "", date: "" });
+  const [eventForm, setEventForm] = useState<InsertEvent>({ name: "", description: "" });
   const [tableForm, setTableForm] = useState<InsertTable>({
-    eventId: "", tableName: "", gameName: "", minPlayers: 2, maxPlayers: 6, estimatedMinutes: 30,
+    eventId: "", tableName: "", gameName: "",
   });
 
   const { data: events = [] } = useQuery<Event[]>({ queryKey: ["/api/events"] });
@@ -83,7 +85,7 @@ export default function AdminPage() {
       const ev = await res.json();
       queryClient.invalidateQueries({ queryKey: ["/api/events"] });
       setCreateEventDialog(false);
-      setEventForm({ name: "", description: "", date: "" });
+      setEventForm({ name: "", description: "" });
       setSelectedEvent(ev.id);
       toast({ title: "Событие создано" });
     } catch (e: any) {
@@ -102,12 +104,28 @@ export default function AdminPage() {
     }
   };
 
+  const handleToggleActive = async (id: string, currentlyActive: boolean) => {
+    try {
+      if (currentlyActive) {
+        await apiRequest("POST", `/api/events/${id}/deactivate`);
+        toast({ title: "Событие деактивировано" });
+      } else {
+        await apiRequest("POST", `/api/events/${id}/activate`);
+        toast({ title: "Событие активировано" });
+      }
+      queryClient.invalidateQueries({ queryKey: ["/api/events"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/events/active"] });
+    } catch (e: any) {
+      toast({ title: "Ошибка", description: e.message, variant: "destructive" });
+    }
+  };
+
   const handleCreateTable = async () => {
     try {
       await apiRequest("POST", "/api/tables", { ...tableForm, eventId: selectedEvent });
       queryClient.invalidateQueries({ queryKey: ["/api/events", selectedEvent, "tables"] });
       setCreateTableDialog(false);
-      setTableForm({ eventId: "", tableName: "", gameName: "", minPlayers: 2, maxPlayers: 6, estimatedMinutes: 30 });
+      setTableForm({ eventId: "", tableName: "", gameName: "" });
       toast({ title: "Стол создан" });
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
@@ -126,7 +144,7 @@ export default function AdminPage() {
 
   const handleDownloadQR = async () => {
     try {
-      const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, "");
+      const baseUrl = window.location.origin;
       const res = await apiRequest("GET", `/api/events/${selectedEvent}/qr-codes?baseUrl=${encodeURIComponent(baseUrl)}`);
       const codes = await res.json();
       // Create printable HTML
@@ -211,14 +229,26 @@ export default function AdminPage() {
                       <div className="flex items-center justify-between">
                         <CardTitle className="text-sm">{ev.name}</CardTitle>
                         <Badge variant={ev.isActive ? "default" : "secondary"} className="text-xs">
-                          {ev.isActive ? "Активно" : "Завершено"}
+                          {ev.isActive ? "Активно" : "Неактивно"}
                         </Badge>
                       </div>
                     </CardHeader>
                     <CardContent className="pb-3">
-                      <p className="text-xs text-muted-foreground">{ev.date}</p>
-                      {ev.description && <p className="text-xs text-muted-foreground mt-1">{ev.description}</p>}
+                      {ev.description && <p className="text-xs text-muted-foreground">{ev.description}</p>}
                       <div className="mt-2 flex gap-2">
+                        <Button
+                          variant={ev.isActive ? "secondary" : "default"}
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={(e) => { e.stopPropagation(); handleToggleActive(ev.id, ev.isActive); }}
+                          data-testid={`button-toggle-event-${ev.id}`}
+                        >
+                          {ev.isActive ? (
+                            <><PowerOff className="w-3 h-3 mr-1" /> Деактивировать</>
+                          ) : (
+                            <><Power className="w-3 h-3 mr-1" /> Активировать</>
+                          )}
+                        </Button>
                         <Button
                           variant="ghost"
                           size="icon"
@@ -258,8 +288,6 @@ export default function AdminPage() {
                     <TableRow>
                       <TableHead>Стол</TableHead>
                       <TableHead>Игра</TableHead>
-                      <TableHead>Игроки</TableHead>
-                      <TableHead>Время</TableHead>
                       <TableHead>Статус</TableHead>
                       <TableHead>Очередь</TableHead>
                       <TableHead></TableHead>
@@ -270,8 +298,6 @@ export default function AdminPage() {
                       <TableRow key={t.id}>
                         <TableCell className="font-medium text-sm">{t.tableName}</TableCell>
                         <TableCell className="text-sm">{t.gameName}</TableCell>
-                        <TableCell className="text-sm">{t.minPlayers}-{t.maxPlayers}</TableCell>
-                        <TableCell className="text-sm">{t.estimatedMinutes} мин</TableCell>
                         <TableCell>
                           <Badge variant={t.status === "free" ? "default" : "secondary"} className="text-xs">
                             {t.status === "free" ? "Свободен" : t.status === "playing" ? "Играют" : "Пауза"}
@@ -351,7 +377,6 @@ export default function AdminPage() {
                       <TableHead>Истекло</TableHead>
                       <TableHead>Пропущено</TableHead>
                       <TableHead>Ожидание</TableHead>
-                      <TableHead>Партия</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -365,7 +390,6 @@ export default function AdminPage() {
                         <TableCell className="text-sm">{a.expiredEntries}</TableCell>
                         <TableCell className="text-sm">{a.skippedEntries}</TableCell>
                         <TableCell className="text-sm">{a.avgWaitMinutes} мин</TableCell>
-                        <TableCell className="text-sm">{a.avgSessionMinutes} мин</TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
@@ -388,12 +412,6 @@ export default function AdminPage() {
               onChange={(e) => setEventForm({ ...eventForm, name: e.target.value })}
             />
             <Input
-              data-testid="input-event-date"
-              type="date"
-              value={eventForm.date}
-              onChange={(e) => setEventForm({ ...eventForm, date: e.target.value })}
-            />
-            <Input
               data-testid="input-event-desc"
               placeholder="Описание (необязательно)"
               value={eventForm.description}
@@ -402,7 +420,7 @@ export default function AdminPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateEventDialog(false)}>Отмена</Button>
-            <Button onClick={handleCreateEvent} disabled={!eventForm.name || !eventForm.date}>Создать</Button>
+            <Button onClick={handleCreateEvent} disabled={!eventForm.name}>Создать</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -424,38 +442,6 @@ export default function AdminPage() {
               value={tableForm.gameName}
               onChange={(e) => setTableForm({ ...tableForm, gameName: e.target.value })}
             />
-            <div className="grid grid-cols-3 gap-2">
-              <div>
-                <label className="text-xs text-muted-foreground">Мин. игроков</label>
-                <Input
-                  data-testid="input-min-players"
-                  type="number"
-                  min={1}
-                  value={tableForm.minPlayers}
-                  onChange={(e) => setTableForm({ ...tableForm, minPlayers: parseInt(e.target.value) || 1 })}
-                />
-              </div>
-              <div>
-                <label className="text-xs text-muted-foreground">Макс. игроков</label>
-                <Input
-                  data-testid="input-max-players"
-                  type="number"
-                  min={1}
-                  value={tableForm.maxPlayers}
-                  onChange={(e) => setTableForm({ ...tableForm, maxPlayers: parseInt(e.target.value) || 1 })}
-                />
-              </div>
-              <div>
-                <label className="text-xs text-muted-foreground">Время (мин)</label>
-                <Input
-                  data-testid="input-est-minutes"
-                  type="number"
-                  min={1}
-                  value={tableForm.estimatedMinutes}
-                  onChange={(e) => setTableForm({ ...tableForm, estimatedMinutes: parseInt(e.target.value) || 1 })}
-                />
-              </div>
-            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateTableDialog(false)}>Отмена</Button>

@@ -17,8 +17,10 @@ export interface IStorage {
   // Events
   getEvents(): Promise<Event[]>;
   getEvent(id: string): Promise<Event | undefined>;
+  getActiveEvent(): Promise<Event | undefined>;
   createEvent(data: InsertEvent): Promise<Event>;
   updateEvent(id: string, data: Partial<Event>): Promise<Event | undefined>;
+  activateEvent(id: string): Promise<Event | undefined>;
   deleteEvent(id: string): Promise<boolean>;
 
   // Tables
@@ -73,11 +75,15 @@ export class MemStorage implements IStorage {
     return this.events.get(id);
   }
 
+  async getActiveEvent(): Promise<Event | undefined> {
+    return Array.from(this.events.values()).find((e) => e.isActive);
+  }
+
   async createEvent(data: InsertEvent): Promise<Event> {
     const event: Event = {
       id: randomUUID(),
       ...data,
-      isActive: true,
+      isActive: false,
       createdAt: new Date().toISOString(),
     };
     this.events.set(event.id, event);
@@ -88,6 +94,20 @@ export class MemStorage implements IStorage {
     const event = this.events.get(id);
     if (!event) return undefined;
     const updated = { ...event, ...data };
+    this.events.set(id, updated);
+    return updated;
+  }
+
+  async activateEvent(id: string): Promise<Event | undefined> {
+    const event = this.events.get(id);
+    if (!event) return undefined;
+    // Deactivate all others first
+    for (const [eid, ev] of this.events) {
+      if (ev.isActive && eid !== id) {
+        this.events.set(eid, { ...ev, isActive: false });
+      }
+    }
+    const updated = { ...event, isActive: true };
     this.events.set(id, updated);
     return updated;
   }
@@ -293,7 +313,7 @@ export class MemStorage implements IStorage {
         expiredEntries: expired.length,
         skippedEntries: skipped.length,
         avgWaitMinutes: waitTimes.length ? Math.round(waitTimes.reduce((a, b) => a + b, 0) / waitTimes.length) : 0,
-        avgSessionMinutes: sessionTimes.length ? Math.round(sessionTimes.reduce((a, b) => a + b, 0) / sessionTimes.length) : table.estimatedMinutes,
+        avgSessionMinutes: sessionTimes.length ? Math.round(sessionTimes.reduce((a, b) => a + b, 0) / sessionTimes.length) : 0,
         peakQueueSize: entries.length, // simplified
       };
     });

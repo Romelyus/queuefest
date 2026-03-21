@@ -95,16 +95,21 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   // ====== AUTH ======
+  // User login — uses active event automatically
   app.post("/api/auth/login", async (req, res) => {
     try {
       const data = loginSchema.parse(req.body);
-      let user = await storage.getUserByBracelet(data.braceletId, data.eventId);
+      const activeEvent = await storage.getActiveEvent();
+      if (!activeEvent) {
+        return res.status(400).json({ message: "Нет активного события. Обратитесь к администратору." });
+      }
+      let user = await storage.getUserByBracelet(data.braceletId, activeEvent.id);
       if (!user) {
         user = await storage.createUser(
           data.braceletId,
           `Гость ${data.braceletId}`,
           UserRole.USER,
-          data.eventId
+          activeEvent.id
         );
       }
       res.json(user);
@@ -114,18 +119,19 @@ export async function registerRoutes(
   });
 
   app.post("/api/auth/admin-login", async (req, res) => {
-    const { password, eventId } = req.body;
-    // Simple admin password - in production use proper auth
+    const { password } = req.body;
+    const activeEvent = await storage.getActiveEvent();
+    const eventId = activeEvent?.id || "global";
     if (password === "admin2026") {
-      let user = await storage.getUserByBracelet("ADMIN", eventId || "global");
+      let user = await storage.getUserByBracelet("ADMIN", eventId);
       if (!user) {
-        user = await storage.createUser("ADMIN", "Администратор", UserRole.ADMIN, eventId || "global");
+        user = await storage.createUser("ADMIN", "Администратор", UserRole.ADMIN, eventId);
       }
       res.json(user);
     } else if (password === "manager2026") {
-      let user = await storage.getUserByBracelet("MANAGER", eventId || "global");
+      let user = await storage.getUserByBracelet("MANAGER", eventId);
       if (!user) {
-        user = await storage.createUser("MANAGER", "Менеджер", UserRole.MANAGER, eventId || "global");
+        user = await storage.createUser("MANAGER", "Менеджер", UserRole.MANAGER, eventId);
       }
       res.json(user);
     } else {
@@ -146,9 +152,8 @@ export async function registerRoutes(
   });
 
   app.get("/api/events/active", async (_req, res) => {
-    const events = await storage.getEvents();
-    const active = events.filter((e) => e.isActive);
-    res.json(active);
+    const active = await storage.getActiveEvent();
+    res.json(active || null);
   });
 
   app.get("/api/events/:id", async (req, res) => {
@@ -169,6 +174,20 @@ export async function registerRoutes(
 
   app.patch("/api/events/:id", async (req, res) => {
     const event = await storage.updateEvent(req.params.id, req.body);
+    if (!event) return res.status(404).json({ message: "Событие не найдено" });
+    res.json(event);
+  });
+
+  // Activate an event (deactivates all others)
+  app.post("/api/events/:id/activate", async (req, res) => {
+    const event = await storage.activateEvent(req.params.id);
+    if (!event) return res.status(404).json({ message: "Событие не найдено" });
+    res.json(event);
+  });
+
+  // Deactivate an event
+  app.post("/api/events/:id/deactivate", async (req, res) => {
+    const event = await storage.updateEvent(req.params.id, { isActive: false });
     if (!event) return res.status(404).json({ message: "Событие не найдено" });
     res.json(event);
   });
@@ -339,10 +358,17 @@ export async function registerRoutes(
     res.json({ success: true });
   });
 
-  // Manager: start session (table becomes "playing")
+  // Manager: start session (supports up to 2 parallel games per table)
   app.post("/api/tables/:tableId/start-session", async (req, res) => {
     const table = await storage.getTable(req.params.tableId);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
+
+    // Count current playing entries
+    const queue = await storage.getActiveQueueForTable(table.id);
+    const playingCount = queue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+    if (playingCount >= 2) {
+      return res.status(400).json({ message: "Максимум 2 параллельных партии на столе" });
+    }
 
     await storage.updateTable(table.id, {
       status: TableStatus.PLAYING,
@@ -350,7 +376,6 @@ export async function registerRoutes(
     });
 
     // Mark confirmed user as playing
-    const queue = await storage.getActiveQueueForTable(table.id);
     const confirmed = queue.find((e) => e.status === QueueEntryStatus.CONFIRMED);
     if (confirmed) {
       await storage.updateQueueEntry(confirmed.id, {
@@ -367,23 +392,29 @@ export async function registerRoutes(
     res.json({ success: true });
   });
 
-  // Manager: end session (table becomes "free", notify next)
+  // Manager: end session (completes all playing entries, table becomes "free" if no more playing)
   app.post("/api/tables/:tableId/end-session", async (req, res) => {
     const table = await storage.getTable(req.params.tableId);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
 
-    await storage.updateTable(table.id, {
-      status: TableStatus.FREE,
-      currentSessionStart: null,
-    });
-
-    // Complete playing entries
+    // Complete all playing entries
     const queue = await storage.getActiveQueueForTable(table.id);
     const playing = queue.filter((e) => e.status === QueueEntryStatus.PLAYING);
     for (const p of playing) {
       await storage.updateQueueEntry(p.id, {
         status: QueueEntryStatus.COMPLETED,
         completedAt: new Date().toISOString(),
+      });
+    }
+
+    // Check if any playing entries remain (shouldn't after completing all)
+    const remainingQueue = await storage.getActiveQueueForTable(table.id);
+    const stillPlaying = remainingQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+
+    if (stillPlaying === 0) {
+      await storage.updateTable(table.id, {
+        status: TableStatus.FREE,
+        currentSessionStart: null,
       });
     }
 
@@ -411,13 +442,16 @@ export async function registerRoutes(
     res.json({ success: true });
   });
 
-  // Manager: force add user to queue
+  // Manager: force add user to queue (auto-creates user if not found)
   app.post("/api/queue/force-add", async (req, res) => {
-    const { tableId, braceletId, eventId } = req.body;
-    const user = await storage.getUserByBracelet(braceletId, eventId);
-    if (!user) return res.status(404).json({ message: "Пользователь с таким браслетом не найден" });
+    const { tableId, braceletId } = req.body;
     const table = await storage.getTable(tableId);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
+    const eventId = table.eventId;
+    let user = await storage.getUserByBracelet(braceletId, eventId);
+    if (!user) {
+      user = await storage.createUser(braceletId, `Гость ${braceletId}`, UserRole.USER, eventId);
+    }
     const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
     if (alreadyInQueue) return res.status(400).json({ message: "Пользователь уже в очереди" });
     const entry = await storage.addToQueue(tableId, user.id, eventId);
@@ -426,6 +460,9 @@ export async function registerRoutes(
       payload: { tableId },
       timestamp: new Date().toISOString(),
     });
+    if (table.status === TableStatus.FREE && entry.position === 1) {
+      await notifyNextInQueue(tableId);
+    }
     res.status(201).json(entry);
   });
 
@@ -494,9 +531,10 @@ export async function registerRoutes(
   app.get("/api/tables/:tableId/qr", async (req, res) => {
     const table = await storage.getTable(req.params.tableId);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
-    const QRCode = await import("qrcode");
+    const qrMod = await import("qrcode");
+    const QRCode = qrMod.default || qrMod;
     const baseUrl = req.query.baseUrl || `${req.protocol}://${req.get("host")}`;
-    const url = `${baseUrl}/#/join/${table.id}`;
+    const url = `${baseUrl}/join/${table.id}`;
     const svg = await QRCode.toString(url, { type: "svg", width: 300 });
     res.type("image/svg+xml").send(svg);
   });
@@ -504,11 +542,12 @@ export async function registerRoutes(
   // Bulk QR generation for printing
   app.get("/api/events/:eventId/qr-codes", async (req, res) => {
     const tables = await storage.getTables(req.params.eventId);
-    const QRCode = await import("qrcode");
+    const qrMod = await import("qrcode");
+    const QRCode = qrMod.default || qrMod;
     const baseUrl = req.query.baseUrl || `${req.protocol}://${req.get("host")}`;
     const codes = await Promise.all(
       tables.map(async (t) => {
-        const url = `${baseUrl}/#/join/${t.id}`;
+        const url = `${baseUrl}/join/${t.id}`;
         const dataUrl = await QRCode.toDataURL(url, { width: 300, margin: 2 });
         return {
           tableId: t.id,
@@ -520,6 +559,11 @@ export async function registerRoutes(
       })
     );
     res.json(codes);
+  });
+
+  // ====== KEEP-ALIVE ======
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
   // ====== WEBSOCKET ======

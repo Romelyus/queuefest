@@ -9,7 +9,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import {
   Play,
@@ -23,6 +22,7 @@ import {
   Users,
   Clock,
   Shield,
+  AlertCircle,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
@@ -36,22 +36,24 @@ export default function ManagerPage() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const { on } = useWebSocket(user?.id);
-  const [selectedEvent, setSelectedEvent] = useState<string>("");
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [addUserDialog, setAddUserDialog] = useState(false);
   const [addBraceletId, setAddBraceletId] = useState("");
 
-  const { data: events = [] } = useQuery<Event[]>({
-    queryKey: ["/api/events"],
+  // Fetch the single active event
+  const { data: activeEvent } = useQuery<Event | null>({
+    queryKey: ["/api/events/active"],
   });
 
+  const activeEventId = activeEvent?.id || "";
+
   const { data: tables = [] } = useQuery<TableWithQueue[]>({
-    queryKey: ["/api/events", selectedEvent, "tables"],
+    queryKey: ["/api/events", activeEventId, "tables"],
     queryFn: async () => {
-      const res = await apiRequest("GET", `/api/events/${selectedEvent}/tables`);
+      const res = await apiRequest("GET", `/api/events/${activeEventId}/tables`);
       return res.json();
     },
-    enabled: !!selectedEvent,
+    enabled: !!activeEventId,
     refetchInterval: 5000,
   });
 
@@ -66,24 +68,19 @@ export default function ManagerPage() {
   });
 
   useEffect(() => {
-    if (events.length > 0 && !selectedEvent) {
-      const active = events.find((e) => e.isActive);
-      if (active) setSelectedEvent(active.id);
-    }
-  }, [events, selectedEvent]);
-
-  useEffect(() => {
     const unsub = on("queue_updated", () => {
       if (selectedTable) refetchQueue();
-      queryClient.invalidateQueries({ queryKey: ["/api/events", selectedEvent, "tables"] });
+      if (activeEventId) {
+        queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
+      }
     });
     return unsub;
-  }, [on, selectedTable, selectedEvent, refetchQueue, queryClient]);
+  }, [on, selectedTable, activeEventId, refetchQueue, queryClient]);
 
   const handleStartSession = async (tableId: string) => {
     try {
       await apiRequest("POST", `/api/tables/${tableId}/start-session`);
-      queryClient.invalidateQueries({ queryKey: ["/api/events", selectedEvent, "tables"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
       refetchQueue();
       toast({ title: "Партия начата" });
     } catch (e: any) {
@@ -94,7 +91,7 @@ export default function ManagerPage() {
   const handleEndSession = async (tableId: string) => {
     try {
       await apiRequest("POST", `/api/tables/${tableId}/end-session`);
-      queryClient.invalidateQueries({ queryKey: ["/api/events", selectedEvent, "tables"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
       refetchQueue();
       toast({ title: "Партия завершена" });
     } catch (e: any) {
@@ -137,12 +134,11 @@ export default function ManagerPage() {
   };
 
   const handleForceAdd = async () => {
-    if (!addBraceletId || !selectedTable || !selectedEvent) return;
+    if (!addBraceletId || !selectedTable) return;
     try {
       await apiRequest("POST", "/api/queue/force-add", {
         tableId: selectedTable,
         braceletId: addBraceletId,
-        eventId: selectedEvent,
       });
       setAddUserDialog(false);
       setAddBraceletId("");
@@ -175,6 +171,11 @@ export default function ManagerPage() {
             <span className="font-semibold text-sm">
               {isAdmin ? "Админ-панель" : "Менеджер"}
             </span>
+            {activeEvent && (
+              <Badge variant="outline" className="text-xs ml-1">
+                {activeEvent.name}
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-2">
             {isAdmin && (
@@ -190,22 +191,13 @@ export default function ManagerPage() {
       </header>
 
       <main className="max-w-4xl mx-auto p-4 space-y-4">
-        {/* Event selector */}
-        <div className="flex gap-3 flex-wrap">
-          <Select value={selectedEvent} onValueChange={(v) => { setSelectedEvent(v); setSelectedTable(null); }}>
-            <SelectTrigger className="w-64" data-testid="select-manager-event">
-              <SelectValue placeholder="Выберите событие" />
-            </SelectTrigger>
-            <SelectContent>
-              {events.map((e) => (
-                <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {!selectedEvent ? (
-          <Card><CardContent className="p-8 text-center text-muted-foreground">Выберите событие</CardContent></Card>
+        {!activeEventId ? (
+          <Card>
+            <CardContent className="p-8 text-center text-muted-foreground">
+              <AlertCircle className="w-8 h-8 mx-auto mb-2 text-amber-500" />
+              <p>Нет активного события. Попросите администратора активировать событие.</p>
+            </CardContent>
+          </Card>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {/* Tables list */}
@@ -253,30 +245,38 @@ export default function ManagerPage() {
                     <CardContent className="p-3 flex items-center justify-between flex-wrap gap-2">
                       <div>
                         <p className="font-medium text-sm">{currentTable?.gameName}</p>
-                        <p className="text-xs text-muted-foreground flex items-center gap-2">
-                          <Clock className="w-3 h-3" />
-                          {currentTable?.estimatedMinutes} мин
-                        </p>
+                        <p className="text-xs text-muted-foreground">{currentTable?.tableName}</p>
                       </div>
                       <div className="flex gap-2">
-                        {currentTable?.status === "free" || currentTable?.status === "paused" ? (
-                          <Button
-                            size="sm"
-                            onClick={() => handleStartSession(selectedTable)}
-                            data-testid="button-start-session"
-                          >
-                            <Play className="w-3.5 h-3.5 mr-1" /> Начать партию
-                          </Button>
-                        ) : (
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            onClick={() => handleEndSession(selectedTable)}
-                            data-testid="button-end-session"
-                          >
-                            <Square className="w-3.5 h-3.5 mr-1" /> Завершить
-                          </Button>
-                        )}
+                        {(() => {
+                          const playingCount = queueEntries.filter(e => e.status === "playing").length;
+                          const hasConfirmed = queueEntries.some(e => e.status === "confirmed");
+                          const canStartAnother = playingCount < 2 && hasConfirmed;
+                          return (
+                            <>
+                              {(currentTable?.status === "free" || currentTable?.status === "paused" || canStartAnother) && (
+                                <Button
+                                  size="sm"
+                                  onClick={() => handleStartSession(selectedTable)}
+                                  data-testid="button-start-session"
+                                >
+                                  <Play className="w-3.5 h-3.5 mr-1" />
+                                  {playingCount > 0 ? "Ещё партию" : "Начать партию"}
+                                </Button>
+                              )}
+                              {currentTable?.status === "playing" && (
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  onClick={() => handleEndSession(selectedTable)}
+                                  data-testid="button-end-session"
+                                >
+                                  <Square className="w-3.5 h-3.5 mr-1" /> Завершить все
+                                </Button>
+                              )}
+                            </>
+                          );
+                        })()}
                         <Button
                           size="sm"
                           variant="outline"
@@ -364,6 +364,9 @@ export default function ManagerPage() {
           <DialogHeader>
             <DialogTitle>Добавить в очередь</DialogTitle>
           </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Введите номер браслета. Если игрок ещё не зарегистрирован, он будет создан автоматически.
+          </p>
           <Input
             data-testid="input-force-bracelet"
             type="text"

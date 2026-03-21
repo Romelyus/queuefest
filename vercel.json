@@ -4,7 +4,8 @@
   "outputDirectory": "dist/public",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
-    { "source": "/ws", "destination": "/api" }
+    { "source": "/ws", "destination": "/api" },
+    { "source": "/((?!api|assets|\\.).*)", "destination": "/index.html" }
   ],
   "functions": {
     "api/index.ts": {
