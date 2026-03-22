@@ -2,11 +2,18 @@
 import express from "express";
 import { createServer } from "http";
 
-// server/routes.ts
-import { WebSocketServer, WebSocket } from "ws";
-
-// server/storage.ts
-import { randomUUID } from "crypto";
+// server/supabase.ts
+import { createClient } from "@supabase/supabase-js";
+var supabaseUrl = process.env.SUPABASE_URL || "";
+var supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.warn(
+    "\u26A0\uFE0F  SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Database operations will fail."
+  );
+}
+var supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: { persistSession: false, autoRefreshToken: false }
+});
 
 // shared/schema.ts
 import { z } from "zod";
@@ -18,24 +25,63 @@ var UserRole = {
 var QueueEntryStatus = {
   WAITING: "waiting",
   NOTIFIED: "notified",
-  // user was notified it's their turn
   CONFIRMED: "confirmed",
-  // user confirmed they're coming
   PLAYING: "playing",
-  // currently at the table
   COMPLETED: "completed",
   CANCELLED: "cancelled",
-  // user cancelled
   EXPIRED: "expired",
-  // user didn't confirm in time
   SKIPPED: "skipped"
-  // manager skipped
 };
 var TableStatus = {
   FREE: "free",
   PLAYING: "playing",
   PAUSED: "paused"
 };
+function toEvent(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    isActive: row.is_active,
+    createdAt: row.created_at
+  };
+}
+function toUser(row) {
+  return {
+    id: row.id,
+    braceletId: row.bracelet_id,
+    name: row.name,
+    role: row.role,
+    eventId: row.event_id,
+    createdAt: row.created_at
+  };
+}
+function toGameTable(row) {
+  return {
+    id: row.id,
+    eventId: row.event_id,
+    tableName: row.table_name,
+    gameName: row.game_name,
+    status: row.status,
+    currentSessionStart: row.current_session_start,
+    qrCode: row.qr_code
+  };
+}
+function toQueueEntry(row) {
+  return {
+    id: row.id,
+    tableId: row.table_id,
+    userId: row.user_id,
+    eventId: row.event_id,
+    position: row.position,
+    status: row.status,
+    joinedAt: row.joined_at,
+    notifiedAt: row.notified_at,
+    confirmedAt: row.confirmed_at,
+    completedAt: row.completed_at,
+    confirmDeadline: row.confirm_deadline
+  };
+}
 var insertEventSchema = z.object({
   name: z.string().min(1, "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u044C\u043D\u043E"),
   description: z.string().default("")
@@ -54,251 +100,262 @@ var joinQueueSchema = z.object({
 });
 
 // server/storage.ts
-var MemStorage = class {
-  events = /* @__PURE__ */ new Map();
-  tables = /* @__PURE__ */ new Map();
-  users = /* @__PURE__ */ new Map();
-  queueEntries = /* @__PURE__ */ new Map();
-  // Events
+var db = supabaseAdmin;
+var ACTIVE_STATUSES = [
+  QueueEntryStatus.WAITING,
+  QueueEntryStatus.NOTIFIED,
+  QueueEntryStatus.CONFIRMED
+];
+var ACTIVE_STATUSES_WITH_PLAYING = [
+  ...ACTIVE_STATUSES,
+  QueueEntryStatus.PLAYING
+];
+var SupabaseStorage = class {
+  // ============ Events ============
   async getEvents() {
-    return Array.from(this.events.values()).sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
+    const { data, error } = await db.from("events").select("*").order("created_at", { ascending: false });
+    if (error) throw error;
+    return (data || []).map(toEvent);
   }
   async getEvent(id) {
-    return this.events.get(id);
+    const { data, error } = await db.from("events").select("*").eq("id", id).maybeSingle();
+    if (error) throw error;
+    return data ? toEvent(data) : void 0;
   }
   async getActiveEvent() {
-    return Array.from(this.events.values()).find((e) => e.isActive);
+    const { data, error } = await db.from("events").select("*").eq("is_active", true).maybeSingle();
+    if (error) throw error;
+    return data ? toEvent(data) : void 0;
   }
-  async createEvent(data) {
-    const event = {
-      id: randomUUID(),
-      ...data,
-      isActive: false,
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.events.set(event.id, event);
-    return event;
+  async createEvent(input) {
+    const { data, error } = await db.from("events").insert({ name: input.name, description: input.description || "", is_active: false }).select().single();
+    if (error) throw error;
+    return toEvent(data);
   }
-  async updateEvent(id, data) {
-    const event = this.events.get(id);
-    if (!event) return void 0;
-    const updated = { ...event, ...data };
-    this.events.set(id, updated);
-    return updated;
+  async updateEvent(id, updates) {
+    const dbUpdates = {};
+    if (updates.name !== void 0) dbUpdates.name = updates.name;
+    if (updates.description !== void 0) dbUpdates.description = updates.description;
+    if (updates.isActive !== void 0) dbUpdates.is_active = updates.isActive;
+    const { data, error } = await db.from("events").update(dbUpdates).eq("id", id).select().maybeSingle();
+    if (error) throw error;
+    return data ? toEvent(data) : void 0;
   }
   async activateEvent(id) {
-    const event = this.events.get(id);
-    if (!event) return void 0;
-    for (const [eid, ev] of this.events) {
-      if (ev.isActive && eid !== id) {
-        this.events.set(eid, { ...ev, isActive: false });
-      }
-    }
-    const updated = { ...event, isActive: true };
-    this.events.set(id, updated);
-    return updated;
+    await db.from("events").update({ is_active: false }).neq("id", id);
+    const { data, error } = await db.from("events").update({ is_active: true }).eq("id", id).select().single();
+    if (error) throw error;
+    return data ? toEvent(data) : void 0;
   }
   async deleteEvent(id) {
-    return this.events.delete(id);
+    const { error } = await db.from("events").delete().eq("id", id);
+    return !error;
   }
-  // Tables
+  // ============ Tables ============
   async getTables(eventId) {
-    return Array.from(this.tables.values()).filter((t) => t.eventId === eventId);
+    const { data, error } = await db.from("game_tables").select("*").eq("event_id", eventId);
+    if (error) throw error;
+    return (data || []).map(toGameTable);
   }
   async getTable(id) {
-    return this.tables.get(id);
+    const { data, error } = await db.from("game_tables").select("*").eq("id", id).maybeSingle();
+    if (error) throw error;
+    return data ? toGameTable(data) : void 0;
   }
-  async createTable(data) {
-    const id = randomUUID();
-    const table = {
-      id,
-      ...data,
+  async createTable(input) {
+    const { data, error } = await db.from("game_tables").insert({
+      event_id: input.eventId,
+      table_name: input.tableName,
+      game_name: input.gameName,
       status: TableStatus.FREE,
-      currentSessionStart: null,
-      qrCode: `/join/${id}`
-    };
-    this.tables.set(id, table);
-    return table;
+      current_session_start: null,
+      qr_code: ""
+      // Will be updated after insert with the ID
+    }).select().single();
+    if (error) throw error;
+    const qrCode = `/join/${data.id}`;
+    await db.from("game_tables").update({ qr_code: qrCode }).eq("id", data.id);
+    return toGameTable({ ...data, qr_code: qrCode });
   }
-  async updateTable(id, data) {
-    const table = this.tables.get(id);
-    if (!table) return void 0;
-    const updated = { ...table, ...data };
-    this.tables.set(id, updated);
-    return updated;
+  async updateTable(id, updates) {
+    const dbUpdates = {};
+    if (updates.tableName !== void 0) dbUpdates.table_name = updates.tableName;
+    if (updates.gameName !== void 0) dbUpdates.game_name = updates.gameName;
+    if (updates.status !== void 0) dbUpdates.status = updates.status;
+    if (updates.currentSessionStart !== void 0) dbUpdates.current_session_start = updates.currentSessionStart;
+    const { data, error } = await db.from("game_tables").update(dbUpdates).eq("id", id).select().maybeSingle();
+    if (error) throw error;
+    return data ? toGameTable(data) : void 0;
   }
   async deleteTable(id) {
-    return this.tables.delete(id);
+    const { error } = await db.from("game_tables").delete().eq("id", id);
+    return !error;
   }
-  // Users
+  // ============ Users ============
   async getUser(id) {
-    return this.users.get(id);
+    const { data, error } = await db.from("users").select("*").eq("id", id).maybeSingle();
+    if (error) throw error;
+    return data ? toUser(data) : void 0;
   }
   async getUserByBracelet(braceletId, eventId) {
-    return Array.from(this.users.values()).find(
-      (u) => u.braceletId === braceletId && u.eventId === eventId
-    );
+    const { data, error } = await db.from("users").select("*").eq("bracelet_id", braceletId).eq("event_id", eventId).maybeSingle();
+    if (error) throw error;
+    return data ? toUser(data) : void 0;
   }
   async createUser(braceletId, name, role, eventId) {
-    const user = {
-      id: randomUUID(),
-      braceletId,
-      name,
-      role,
-      eventId,
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    this.users.set(user.id, user);
-    return user;
+    const { data, error } = await db.from("users").insert({ bracelet_id: braceletId, name, role, event_id: eventId }).select().single();
+    if (error) throw error;
+    return toUser(data);
   }
   async getUsers(eventId) {
-    return Array.from(this.users.values()).filter((u) => u.eventId === eventId);
+    const { data, error } = await db.from("users").select("*").eq("event_id", eventId);
+    if (error) throw error;
+    return (data || []).map(toUser);
   }
-  // Queue
+  // ============ Queue ============
   async getQueueForTable(tableId) {
-    return Array.from(this.queueEntries.values()).filter((e) => e.tableId === tableId).sort((a, b) => a.position - b.position);
+    const { data, error } = await db.from("queue_entries").select("*").eq("table_id", tableId).order("position", { ascending: true });
+    if (error) throw error;
+    return (data || []).map(toQueueEntry);
   }
   async getActiveQueueForTable(tableId) {
-    const activeStatuses = [
-      QueueEntryStatus.WAITING,
-      QueueEntryStatus.NOTIFIED,
-      QueueEntryStatus.CONFIRMED
-    ];
-    return Array.from(this.queueEntries.values()).filter((e) => e.tableId === tableId && activeStatuses.includes(e.status)).sort((a, b) => a.position - b.position);
+    const { data, error } = await db.from("queue_entries").select("*").eq("table_id", tableId).in("status", ACTIVE_STATUSES).order("position", { ascending: true });
+    if (error) throw error;
+    return (data || []).map(toQueueEntry);
   }
   async getUserQueues(userId) {
-    const activeStatuses = [
-      QueueEntryStatus.WAITING,
-      QueueEntryStatus.NOTIFIED,
-      QueueEntryStatus.CONFIRMED,
-      QueueEntryStatus.PLAYING
-    ];
-    const entries = Array.from(this.queueEntries.values()).filter((e) => e.userId === userId && activeStatuses.includes(e.status)).sort((a, b) => new Date(a.joinedAt).getTime() - new Date(b.joinedAt).getTime());
-    return entries.map((e) => ({ ...e, table: this.tables.get(e.tableId) }));
+    const { data, error } = await db.from("queue_entries").select("*, game_tables(*)").eq("user_id", userId).in("status", ACTIVE_STATUSES_WITH_PLAYING).order("joined_at", { ascending: true });
+    if (error) throw error;
+    return (data || []).map((row) => {
+      const entry = toQueueEntry(row);
+      const table = row.game_tables ? toGameTable(row.game_tables) : void 0;
+      return { ...entry, table };
+    });
   }
   async addToQueue(tableId, userId, eventId) {
-    const existing = await this.getActiveQueueForTable(tableId);
-    const position = existing.length + 1;
-    const entry = {
-      id: randomUUID(),
-      tableId,
-      userId,
-      eventId,
+    const active = await this.getActiveQueueForTable(tableId);
+    const position = active.length + 1;
+    const { data, error } = await db.from("queue_entries").insert({
+      table_id: tableId,
+      user_id: userId,
+      event_id: eventId,
       position,
       status: QueueEntryStatus.WAITING,
-      joinedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      notifiedAt: null,
-      confirmedAt: null,
-      completedAt: null,
-      confirmDeadline: null
-    };
-    this.queueEntries.set(entry.id, entry);
-    return entry;
+      notified_at: null,
+      confirmed_at: null,
+      completed_at: null,
+      confirm_deadline: null
+    }).select().single();
+    if (error) throw error;
+    return toQueueEntry(data);
   }
   async removeFromQueue(entryId) {
-    const entry = this.queueEntries.get(entryId);
+    const entry = await this.getQueueEntry(entryId);
     if (!entry) return false;
-    entry.status = QueueEntryStatus.CANCELLED;
-    entry.completedAt = (/* @__PURE__ */ new Date()).toISOString();
-    this.queueEntries.set(entryId, entry);
-    const active = await this.getActiveQueueForTable(entry.tableId);
-    active.forEach((e, i) => {
-      e.position = i + 1;
-      this.queueEntries.set(e.id, e);
+    await this.updateQueueEntry(entryId, {
+      status: QueueEntryStatus.CANCELLED,
+      completedAt: (/* @__PURE__ */ new Date()).toISOString()
     });
+    const active = await this.getActiveQueueForTable(entry.tableId);
+    for (let i = 0; i < active.length; i++) {
+      await this.updateQueueEntry(active[i].id, { position: i + 1 });
+    }
     return true;
   }
-  async updateQueueEntry(id, data) {
-    const entry = this.queueEntries.get(id);
-    if (!entry) return void 0;
-    const updated = { ...entry, ...data };
-    this.queueEntries.set(id, updated);
-    return updated;
+  async updateQueueEntry(id, updates) {
+    const dbUpdates = {};
+    if (updates.status !== void 0) dbUpdates.status = updates.status;
+    if (updates.position !== void 0) dbUpdates.position = updates.position;
+    if (updates.notifiedAt !== void 0) dbUpdates.notified_at = updates.notifiedAt;
+    if (updates.confirmedAt !== void 0) dbUpdates.confirmed_at = updates.confirmedAt;
+    if (updates.completedAt !== void 0) dbUpdates.completed_at = updates.completedAt;
+    if (updates.confirmDeadline !== void 0) dbUpdates.confirm_deadline = updates.confirmDeadline;
+    const { data, error } = await db.from("queue_entries").update(dbUpdates).eq("id", id).select().maybeSingle();
+    if (error) throw error;
+    return data ? toQueueEntry(data) : void 0;
   }
   async getQueueEntry(id) {
-    return this.queueEntries.get(id);
+    const { data, error } = await db.from("queue_entries").select("*").eq("id", id).maybeSingle();
+    if (error) throw error;
+    return data ? toQueueEntry(data) : void 0;
   }
   async isUserInQueue(userId, tableId) {
-    const activeStatuses = [
-      QueueEntryStatus.WAITING,
-      QueueEntryStatus.NOTIFIED,
-      QueueEntryStatus.CONFIRMED,
-      QueueEntryStatus.PLAYING
-    ];
-    return Array.from(this.queueEntries.values()).some(
-      (e) => e.userId === userId && e.tableId === tableId && activeStatuses.includes(e.status)
-    );
+    const { data, error } = await db.from("queue_entries").select("id").eq("user_id", userId).eq("table_id", tableId).in("status", ACTIVE_STATUSES_WITH_PLAYING).limit(1);
+    if (error) throw error;
+    return (data || []).length > 0;
   }
   async reorderQueue(tableId, entryIds) {
-    entryIds.forEach((id, index) => {
-      const entry = this.queueEntries.get(id);
-      if (entry && entry.tableId === tableId) {
-        entry.position = index + 1;
-        this.queueEntries.set(id, entry);
-      }
-    });
+    for (let i = 0; i < entryIds.length; i++) {
+      await db.from("queue_entries").update({ position: i + 1 }).eq("id", entryIds[i]).eq("table_id", tableId);
+    }
   }
   async getNextInQueue(tableId) {
-    const active = await this.getActiveQueueForTable(tableId);
-    return active.find((e) => e.status === QueueEntryStatus.WAITING);
+    const { data, error } = await db.from("queue_entries").select("*").eq("table_id", tableId).eq("status", QueueEntryStatus.WAITING).order("position", { ascending: true }).limit(1).maybeSingle();
+    if (error) throw error;
+    return data ? toQueueEntry(data) : void 0;
   }
-  // Analytics
+  // ============ Subscriptions ============
+  async getSubscription(queueEntryId) {
+    const { data, error } = await db.from("users_subscriptions").select("chat_id, messenger").eq("queue_entry_id", queueEntryId).maybeSingle();
+    if (error) throw error;
+    return data || void 0;
+  }
+  async saveSubscription(queueEntryId, chatId, messenger) {
+    const { error } = await db.from("users_subscriptions").upsert(
+      { queue_entry_id: queueEntryId, chat_id: chatId, messenger },
+      { onConflict: "queue_entry_id,messenger" }
+    );
+    if (error) throw error;
+  }
+  // ============ Analytics ============
   async getAnalytics(eventId) {
     const tables = await this.getTables(eventId);
-    return tables.map((table) => {
-      const entries = Array.from(this.queueEntries.values()).filter(
-        (e) => e.tableId === table.id
-      );
-      const completed = entries.filter((e) => e.status === QueueEntryStatus.COMPLETED);
-      const cancelled = entries.filter((e) => e.status === QueueEntryStatus.CANCELLED);
-      const expired = entries.filter((e) => e.status === QueueEntryStatus.EXPIRED);
-      const skipped = entries.filter((e) => e.status === QueueEntryStatus.SKIPPED);
+    const results = [];
+    for (const table of tables) {
+      const { data: entries } = await db.from("queue_entries").select("*").eq("table_id", table.id);
+      const all = (entries || []).map(toQueueEntry);
+      const completed = all.filter((e) => e.status === QueueEntryStatus.COMPLETED);
+      const cancelled = all.filter((e) => e.status === QueueEntryStatus.CANCELLED);
+      const expired = all.filter((e) => e.status === QueueEntryStatus.EXPIRED);
+      const skipped = all.filter((e) => e.status === QueueEntryStatus.SKIPPED);
       const waitTimes = completed.filter((e) => e.confirmedAt && e.joinedAt).map((e) => (new Date(e.confirmedAt).getTime() - new Date(e.joinedAt).getTime()) / 6e4);
       const sessionTimes = completed.filter((e) => e.completedAt && e.confirmedAt).map((e) => (new Date(e.completedAt).getTime() - new Date(e.confirmedAt).getTime()) / 6e4);
-      return {
+      results.push({
         tableId: table.id,
         tableName: table.tableName,
         gameName: table.gameName,
-        totalEntries: entries.length,
+        totalEntries: all.length,
         completedEntries: completed.length,
         cancelledEntries: cancelled.length,
         expiredEntries: expired.length,
         skippedEntries: skipped.length,
         avgWaitMinutes: waitTimes.length ? Math.round(waitTimes.reduce((a, b) => a + b, 0) / waitTimes.length) : 0,
         avgSessionMinutes: sessionTimes.length ? Math.round(sessionTimes.reduce((a, b) => a + b, 0) / sessionTimes.length) : 0,
-        peakQueueSize: entries.length
-        // simplified
-      };
-    });
+        peakQueueSize: all.length
+      });
+    }
+    return results;
   }
   async getEventStats(eventId) {
     const users = await this.getUsers(eventId);
-    const allEntries = Array.from(this.queueEntries.values()).filter(
-      (e) => e.eventId === eventId
-    );
-    const activeStatuses = [
-      QueueEntryStatus.WAITING,
-      QueueEntryStatus.NOTIFIED,
-      QueueEntryStatus.CONFIRMED
-    ];
-    const active = allEntries.filter((e) => activeStatuses.includes(e.status));
-    const completedEntries = allEntries.filter(
+    const { data: allEntries } = await db.from("queue_entries").select("*").eq("event_id", eventId);
+    const all = (allEntries || []).map(toQueueEntry);
+    const active = all.filter((e) => ACTIVE_STATUSES.includes(e.status));
+    const completedWithConfirm = all.filter(
       (e) => e.status === QueueEntryStatus.COMPLETED && e.confirmedAt
     );
-    const waitTimes = completedEntries.map(
+    const waitTimes = completedWithConfirm.map(
       (e) => (new Date(e.confirmedAt).getTime() - new Date(e.joinedAt).getTime()) / 6e4
     );
     return {
       totalVisitors: users.filter((u) => u.role === "user").length,
-      totalQueueEntries: allEntries.length,
+      totalQueueEntries: all.length,
       activeQueues: active.length,
       avgWaitTime: waitTimes.length ? Math.round(waitTimes.reduce((a, b) => a + b, 0) / waitTimes.length) : 0
     };
   }
 };
-var storage = new MemStorage();
+var storage = new SupabaseStorage();
 
 // server/log.ts
 function log(message, source = "express") {
@@ -312,24 +369,28 @@ function log(message, source = "express") {
 }
 
 // server/routes.ts
-var wsClients = /* @__PURE__ */ new Map();
-function broadcastToUser(userId, message) {
-  const clients = wsClients.get(userId);
-  if (clients) {
-    const data = JSON.stringify(message);
-    clients.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(data);
-      }
-    });
+var BOT_TOKEN = process.env.BOT_TOKEN || "";
+async function sendTelegramMessage(chatId, text) {
+  if (!BOT_TOKEN) {
+    log("\u26A0\uFE0F  BOT_TOKEN not set, skipping Telegram notification");
+    return false;
   }
-}
-function broadcastToTable(tableId, message) {
-  storage.getQueueForTable(tableId).then((entries) => {
-    entries.forEach((entry) => {
-      broadcastToUser(entry.userId, message);
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" })
     });
-  });
+    const result = await res.json();
+    if (!result.ok) {
+      log(`Telegram error: ${JSON.stringify(result)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    log(`Telegram send error: ${e.message}`);
+    return false;
+  }
 }
 var CONFIRM_TIMEOUT_MS = 3 * 60 * 1e3;
 var confirmTimers = /* @__PURE__ */ new Map();
@@ -342,11 +403,21 @@ async function notifyNextInQueue(tableId) {
     notifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
     confirmDeadline: deadline
   });
-  broadcastToUser(next.userId, {
-    type: "your_turn",
-    payload: { entryId: next.id, tableId, deadline },
-    timestamp: (/* @__PURE__ */ new Date()).toISOString()
-  });
+  const sub = await storage.getSubscription(next.id);
+  if (sub?.chat_id) {
+    const table = await storage.getTable(next.tableId);
+    const gameName = table?.gameName || "\u0438\u0433\u0440\u0430";
+    const tableName = table?.tableName || "\u0441\u0442\u043E\u043B";
+    await sendTelegramMessage(
+      sub.chat_id,
+      `\u{1F3B2} <b>\u0412\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043F\u043E\u0434\u043E\u0448\u043B\u0430!</b>
+
+\u0418\u0433\u0440\u0430: ${gameName}
+\u0421\u0442\u043E\u043B: ${tableName}
+
+\u041F\u043E\u0434\u043E\u0439\u0434\u0438\u0442\u0435 \u043A \u0441\u0442\u043E\u043B\u0443 \u0432 \u0442\u0435\u0447\u0435\u043D\u0438\u0435 3 \u043C\u0438\u043D\u0443\u0442.`
+    );
+  }
   const timer = setTimeout(async () => {
     const entry = await storage.getQueueEntry(next.id);
     if (entry && entry.status === QueueEntryStatus.NOTIFIED) {
@@ -354,21 +425,11 @@ async function notifyNextInQueue(tableId) {
         status: QueueEntryStatus.EXPIRED,
         completedAt: (/* @__PURE__ */ new Date()).toISOString()
       });
-      broadcastToUser(next.userId, {
-        type: "confirm_timeout",
-        payload: { entryId: next.id, tableId },
-        timestamp: (/* @__PURE__ */ new Date()).toISOString()
-      });
       const active = await storage.getActiveQueueForTable(tableId);
-      active.forEach((e, i) => {
-        storage.updateQueueEntry(e.id, { position: i + 1 });
-      });
+      for (let i = 0; i < active.length; i++) {
+        await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+      }
       await notifyNextInQueue(tableId);
-      broadcastToTable(tableId, {
-        type: "queue_updated",
-        payload: { tableId },
-        timestamp: (/* @__PURE__ */ new Date()).toISOString()
-      });
     }
     confirmTimers.delete(next.id);
   }, CONFIRM_TIMEOUT_MS);
@@ -491,11 +552,6 @@ async function registerRoutes(httpServer2, app2) {
   app2.patch("/api/tables/:id", async (req, res) => {
     const table = await storage.updateTable(req.params.id, req.body);
     if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-    broadcastToTable(table.id, {
-      type: "table_status_changed",
-      payload: { tableId: table.id, status: table.status },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     res.json(table);
   });
   app2.delete("/api/tables/:id", async (req, res) => {
@@ -528,11 +584,6 @@ async function registerRoutes(httpServer2, app2) {
       if (alreadyInQueue)
         return res.status(400).json({ message: "\u0412\u044B \u0443\u0436\u0435 \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438 \u043D\u0430 \u044D\u0442\u043E\u0442 \u0441\u0442\u043E\u043B" });
       const entry = await storage.addToQueue(data.tableId, data.userId, table.eventId);
-      broadcastToTable(data.tableId, {
-        type: "queue_updated",
-        payload: { tableId: data.tableId },
-        timestamp: (/* @__PURE__ */ new Date()).toISOString()
-      });
       if (table.status === TableStatus.FREE && entry.position === 1) {
         await notifyNextInQueue(data.tableId);
       }
@@ -556,11 +607,6 @@ async function registerRoutes(httpServer2, app2) {
       status: QueueEntryStatus.CONFIRMED,
       confirmedAt: (/* @__PURE__ */ new Date()).toISOString()
     });
-    broadcastToUser(entry.userId, {
-      type: "queue_updated",
-      payload: { entryId: entry.id, status: QueueEntryStatus.CONFIRMED },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     res.json(updated);
   });
   app2.post("/api/queue/:entryId/cancel", async (req, res) => {
@@ -573,16 +619,6 @@ async function registerRoutes(httpServer2, app2) {
     }
     const ok = await storage.removeFromQueue(entry.id);
     if (!ok) return res.status(400).json({ message: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u0442\u043C\u0435\u043D\u0438\u0442\u044C" });
-    broadcastToUser(entry.userId, {
-      type: "removed_from_queue",
-      payload: { entryId: entry.id, tableId: entry.tableId },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    broadcastToTable(entry.tableId, {
-      type: "queue_updated",
-      payload: { tableId: entry.tableId },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     res.json({ success: true });
   });
   app2.post("/api/tables/:tableId/start-session", async (req, res) => {
@@ -603,11 +639,6 @@ async function registerRoutes(httpServer2, app2) {
         status: QueueEntryStatus.PLAYING
       });
     }
-    broadcastToTable(table.id, {
-      type: "session_started",
-      payload: { tableId: table.id },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     res.json({ success: true });
   });
   app2.post("/api/tables/:tableId/end-session", async (req, res) => {
@@ -630,20 +661,10 @@ async function registerRoutes(httpServer2, app2) {
       });
     }
     const remaining = await storage.getActiveQueueForTable(table.id);
-    remaining.forEach((e, i) => {
-      storage.updateQueueEntry(e.id, { position: i + 1 });
-    });
-    broadcastToTable(table.id, {
-      type: "session_ended",
-      payload: { tableId: table.id },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
+    for (let i = 0; i < remaining.length; i++) {
+      await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+    }
     await notifyNextInQueue(table.id);
-    broadcastToTable(table.id, {
-      type: "queue_updated",
-      payload: { tableId: table.id },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     res.json({ success: true });
   });
   app2.post("/api/queue/force-add", async (req, res) => {
@@ -658,11 +679,6 @@ async function registerRoutes(httpServer2, app2) {
     const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
     if (alreadyInQueue) return res.status(400).json({ message: "\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C \u0443\u0436\u0435 \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438" });
     const entry = await storage.addToQueue(tableId, user.id, eventId);
-    broadcastToTable(tableId, {
-      type: "queue_updated",
-      payload: { tableId },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     if (table.status === TableStatus.FREE && entry.position === 1) {
       await notifyNextInQueue(tableId);
     }
@@ -672,11 +688,6 @@ async function registerRoutes(httpServer2, app2) {
     const { entryIds } = req.body;
     if (!Array.isArray(entryIds)) return res.status(400).json({ message: "entryIds required" });
     await storage.reorderQueue(req.params.tableId, entryIds);
-    broadcastToTable(req.params.tableId, {
-      type: "queue_updated",
-      payload: { tableId: req.params.tableId },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
     res.json({ success: true });
   });
   app2.post("/api/queue/:entryId/skip", async (req, res) => {
@@ -692,19 +703,9 @@ async function registerRoutes(httpServer2, app2) {
       completedAt: (/* @__PURE__ */ new Date()).toISOString()
     });
     const active = await storage.getActiveQueueForTable(entry.tableId);
-    active.forEach((e, i) => {
-      storage.updateQueueEntry(e.id, { position: i + 1 });
-    });
-    broadcastToUser(entry.userId, {
-      type: "removed_from_queue",
-      payload: { entryId: entry.id, tableId: entry.tableId, reason: "skipped" },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    broadcastToTable(entry.tableId, {
-      type: "queue_updated",
-      payload: { tableId: entry.tableId },
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    });
+    for (let i = 0; i < active.length; i++) {
+      await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+    }
     res.json({ success: true });
   });
   app2.get("/api/events/:eventId/analytics", async (req, res) => {
@@ -745,44 +746,55 @@ async function registerRoutes(httpServer2, app2) {
     );
     res.json(codes);
   });
+  app2.post("/api/telegram/webhook", async (req, res) => {
+    try {
+      const update = req.body;
+      const message = update?.message;
+      if (!message?.text) {
+        return res.json({ ok: true });
+      }
+      const chatId = String(message.chat.id);
+      const text = message.text.trim();
+      if (text.startsWith("/start")) {
+        const parts = text.split(" ");
+        if (parts.length >= 2 && parts[1].startsWith("queue_")) {
+          const queueEntryId = parts[1].replace("queue_", "");
+          const entry = await storage.getQueueEntry(queueEntryId);
+          if (entry) {
+            await storage.saveSubscription(queueEntryId, chatId, "telegram");
+            await sendTelegramMessage(
+              chatId,
+              `\u2705 <b>\u0423\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u044B!</b>
+
+\u0412\u044B \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435, \u043A\u043E\u0433\u0434\u0430 \u043F\u043E\u0434\u043E\u0439\u0434\u0451\u0442 \u0432\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C.
+
+\u{1F3B2} \u0423\u0434\u0430\u0447\u043D\u043E\u0439 \u0438\u0433\u0440\u044B \u043D\u0430 \u0444\u0435\u0441\u0442\u0438\u0432\u0430\u043B\u0435!`
+            );
+          } else {
+            await sendTelegramMessage(
+              chatId,
+              `\u274C \u0417\u0430\u043F\u0438\u0441\u044C \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430. \u041F\u043E\u043F\u0440\u043E\u0431\u0443\u0439\u0442\u0435 \u0437\u0430\u043F\u0438\u0441\u0430\u0442\u044C\u0441\u044F \u0437\u0430\u043D\u043E\u0432\u043E \u0447\u0435\u0440\u0435\u0437 QR-\u043A\u043E\u0434 \u043D\u0430 \u0441\u0442\u043E\u043B\u0435.`
+            );
+          }
+        } else {
+          await sendTelegramMessage(
+            chatId,
+            `\u{1F44B} <b>\u0414\u043E\u0431\u0440\u043E \u043F\u043E\u0436\u0430\u043B\u043E\u0432\u0430\u0442\u044C \u0432 QueueFest!</b>
+
+\u042F \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u044E \u0432\u0430\u0441, \u043A\u043E\u0433\u0434\u0430 \u043F\u043E\u0434\u043E\u0439\u0434\u0451\u0442 \u0432\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043D\u0430 \u0444\u0435\u0441\u0442\u0438\u0432\u0430\u043B\u0435 \u043D\u0430\u0441\u0442\u043E\u043B\u044C\u043D\u044B\u0445 \u0438\u0433\u0440.
+
+\u0427\u0442\u043E\u0431\u044B \u043F\u043E\u0434\u043F\u0438\u0441\u0430\u0442\u044C\u0441\u044F, \u0437\u0430\u043F\u0438\u0448\u0438\u0442\u0435\u0441\u044C \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u0447\u0435\u0440\u0435\u0437 \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u0435 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 \u043A\u043D\u043E\u043F\u043A\u0443 \xAB\u0423\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F \u0432 Telegram\xBB.`
+          );
+        }
+      }
+      res.json({ ok: true });
+    } catch (e) {
+      log(`Webhook error: ${e.message}`);
+      res.json({ ok: true });
+    }
+  });
   app2.get("/api/health", (_req, res) => {
     res.json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
-  });
-  const wss = new WebSocketServer({ server: httpServer2, path: "/ws" });
-  wss.on("connection", (ws, req) => {
-    let userId = null;
-    ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === "auth" && msg.userId) {
-          userId = msg.userId;
-          if (!wsClients.has(userId)) {
-            wsClients.set(userId, /* @__PURE__ */ new Set());
-          }
-          wsClients.get(userId).add(ws);
-          log(`WS client connected: ${userId}`);
-        }
-      } catch (e) {
-      }
-    });
-    ws.on("close", () => {
-      if (userId) {
-        const clients = wsClients.get(userId);
-        if (clients) {
-          clients.delete(ws);
-          if (clients.size === 0) {
-            wsClients.delete(userId);
-          }
-        }
-        log(`WS client disconnected: ${userId}`);
-      }
-    });
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
-      }
-    }, 3e4);
-    ws.on("close", () => clearInterval(pingInterval));
   });
   return httpServer2;
 }

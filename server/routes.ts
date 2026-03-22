@@ -1,6 +1,5 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
-import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { log } from "./log";
 import {
@@ -12,30 +11,31 @@ import {
   TableStatus,
   UserRole,
 } from "../shared/schema";
-import type { WSMessage } from "../shared/schema";
 
-// WebSocket connections mapped by userId
-const wsClients = new Map<string, Set<WebSocket>>();
+// Telegram Bot API helper
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
-function broadcastToUser(userId: string, message: WSMessage) {
-  const clients = wsClients.get(userId);
-  if (clients) {
-    const data = JSON.stringify(message);
-    clients.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(data);
-      }
-    });
+async function sendTelegramMessage(chatId: string, text: string): Promise<boolean> {
+  if (!BOT_TOKEN) {
+    log("⚠️  BOT_TOKEN not set, skipping Telegram notification");
+    return false;
   }
-}
-
-function broadcastToTable(tableId: string, message: WSMessage) {
-  // Send to all users in queue for this table
-  storage.getQueueForTable(tableId).then((entries) => {
-    entries.forEach((entry) => {
-      broadcastToUser(entry.userId, message);
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
     });
-  });
+    const result = await res.json();
+    if (!result.ok) {
+      log(`Telegram error: ${JSON.stringify(result)}`);
+      return false;
+    }
+    return true;
+  } catch (e: any) {
+    log(`Telegram send error: ${e.message}`);
+    return false;
+  }
 }
 
 // Confirmation timeout: 3 minutes
@@ -53,11 +53,17 @@ async function notifyNextInQueue(tableId: string) {
     confirmDeadline: deadline,
   });
 
-  broadcastToUser(next.userId, {
-    type: "your_turn",
-    payload: { entryId: next.id, tableId, deadline },
-    timestamp: new Date().toISOString(),
-  });
+  // Try to send Telegram notification
+  const sub = await storage.getSubscription(next.id);
+  if (sub?.chat_id) {
+    const table = await storage.getTable(next.tableId);
+    const gameName = table?.gameName || "игра";
+    const tableName = table?.tableName || "стол";
+    await sendTelegramMessage(
+      sub.chat_id,
+      `🎲 <b>Ваша очередь подошла!</b>\n\nИгра: ${gameName}\nСтол: ${tableName}\n\nПодойдите к столу в течение 3 минут.`
+    );
+  }
 
   // Set confirmation timeout
   const timer = setTimeout(async () => {
@@ -67,22 +73,12 @@ async function notifyNextInQueue(tableId: string) {
         status: QueueEntryStatus.EXPIRED,
         completedAt: new Date().toISOString(),
       });
-      broadcastToUser(next.userId, {
-        type: "confirm_timeout",
-        payload: { entryId: next.id, tableId },
-        timestamp: new Date().toISOString(),
-      });
       // Reposition remaining and notify next person
       const active = await storage.getActiveQueueForTable(tableId);
-      active.forEach((e, i) => {
-        storage.updateQueueEntry(e.id, { position: i + 1 });
-      });
+      for (let i = 0; i < active.length; i++) {
+        await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+      }
       await notifyNextInQueue(tableId);
-      broadcastToTable(tableId, {
-        type: "queue_updated",
-        payload: { tableId },
-        timestamp: new Date().toISOString(),
-      });
     }
     confirmTimers.delete(next.id);
   }, CONFIRM_TIMEOUT_MS);
@@ -178,14 +174,12 @@ export async function registerRoutes(
     res.json(event);
   });
 
-  // Activate an event (deactivates all others)
   app.post("/api/events/:id/activate", async (req, res) => {
     const event = await storage.activateEvent(req.params.id);
     if (!event) return res.status(404).json({ message: "Событие не найдено" });
     res.json(event);
   });
 
-  // Deactivate an event
   app.post("/api/events/:id/deactivate", async (req, res) => {
     const event = await storage.updateEvent(req.params.id, { isActive: false });
     if (!event) return res.status(404).json({ message: "Событие не найдено" });
@@ -201,7 +195,6 @@ export async function registerRoutes(
   // ====== TABLES ======
   app.get("/api/events/:eventId/tables", async (req, res) => {
     const tables = await storage.getTables(req.params.eventId);
-    // Attach queue info
     const tablesWithQueue = await Promise.all(
       tables.map(async (t) => {
         const queue = await storage.getActiveQueueForTable(t.id);
@@ -231,12 +224,6 @@ export async function registerRoutes(
   app.patch("/api/tables/:id", async (req, res) => {
     const table = await storage.updateTable(req.params.id, req.body);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
-    // Broadcast table status change
-    broadcastToTable(table.id, {
-      type: "table_status_changed",
-      payload: { tableId: table.id, status: table.status },
-      timestamp: new Date().toISOString(),
-    });
     res.json(table);
   });
 
@@ -249,7 +236,6 @@ export async function registerRoutes(
   // ====== QUEUE ======
   app.get("/api/tables/:tableId/queue", async (req, res) => {
     const queue = await storage.getActiveQueueForTable(req.params.tableId);
-    // Enrich with user names
     const enriched = await Promise.all(
       queue.map(async (e) => {
         const user = await storage.getUser(e.userId);
@@ -267,27 +253,17 @@ export async function registerRoutes(
   app.post("/api/queue/join", async (req, res) => {
     try {
       const data = joinQueueSchema.parse(req.body);
-      // Check if user exists
       const user = await storage.getUser(data.userId);
       if (!user) return res.status(404).json({ message: "Пользователь не найден" });
 
-      // Check if table exists
       const table = await storage.getTable(data.tableId);
       if (!table) return res.status(404).json({ message: "Стол не найден" });
 
-      // Check if already in queue
       const alreadyInQueue = await storage.isUserInQueue(data.userId, data.tableId);
       if (alreadyInQueue)
         return res.status(400).json({ message: "Вы уже в очереди на этот стол" });
 
       const entry = await storage.addToQueue(data.tableId, data.userId, table.eventId);
-
-      // Broadcast queue update
-      broadcastToTable(data.tableId, {
-        type: "queue_updated",
-        payload: { tableId: data.tableId },
-        timestamp: new Date().toISOString(),
-      });
 
       // If table is free and this is first in queue, notify immediately
       if (table.status === TableStatus.FREE && entry.position === 1) {
@@ -308,7 +284,6 @@ export async function registerRoutes(
       return res.status(400).json({ message: "Подтверждение невозможно в текущем статусе" });
     }
 
-    // Clear timeout
     const timer = confirmTimers.get(entry.id);
     if (timer) {
       clearTimeout(timer);
@@ -320,12 +295,6 @@ export async function registerRoutes(
       confirmedAt: new Date().toISOString(),
     });
 
-    broadcastToUser(entry.userId, {
-      type: "queue_updated",
-      payload: { entryId: entry.id, status: QueueEntryStatus.CONFIRMED },
-      timestamp: new Date().toISOString(),
-    });
-
     res.json(updated);
   });
 
@@ -333,7 +302,6 @@ export async function registerRoutes(
     const entry = await storage.getQueueEntry(req.params.entryId);
     if (!entry) return res.status(404).json({ message: "Запись не найдена" });
 
-    // Clear any pending timeout
     const timer = confirmTimers.get(entry.id);
     if (timer) {
       clearTimeout(timer);
@@ -343,18 +311,6 @@ export async function registerRoutes(
     const ok = await storage.removeFromQueue(entry.id);
     if (!ok) return res.status(400).json({ message: "Не удалось отменить" });
 
-    broadcastToUser(entry.userId, {
-      type: "removed_from_queue",
-      payload: { entryId: entry.id, tableId: entry.tableId },
-      timestamp: new Date().toISOString(),
-    });
-
-    broadcastToTable(entry.tableId, {
-      type: "queue_updated",
-      payload: { tableId: entry.tableId },
-      timestamp: new Date().toISOString(),
-    });
-
     res.json({ success: true });
   });
 
@@ -363,7 +319,6 @@ export async function registerRoutes(
     const table = await storage.getTable(req.params.tableId);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
 
-    // Count current playing entries
     const queue = await storage.getActiveQueueForTable(table.id);
     const playingCount = queue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
     if (playingCount >= 2) {
@@ -375,7 +330,6 @@ export async function registerRoutes(
       currentSessionStart: new Date().toISOString(),
     });
 
-    // Mark confirmed user as playing
     const confirmed = queue.find((e) => e.status === QueueEntryStatus.CONFIRMED);
     if (confirmed) {
       await storage.updateQueueEntry(confirmed.id, {
@@ -383,21 +337,14 @@ export async function registerRoutes(
       });
     }
 
-    broadcastToTable(table.id, {
-      type: "session_started",
-      payload: { tableId: table.id },
-      timestamp: new Date().toISOString(),
-    });
-
     res.json({ success: true });
   });
 
-  // Manager: end session (completes all playing entries, table becomes "free" if no more playing)
+  // Manager: end session (completes all playing entries)
   app.post("/api/tables/:tableId/end-session", async (req, res) => {
     const table = await storage.getTable(req.params.tableId);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
 
-    // Complete all playing entries
     const queue = await storage.getActiveQueueForTable(table.id);
     const playing = queue.filter((e) => e.status === QueueEntryStatus.PLAYING);
     for (const p of playing) {
@@ -407,7 +354,6 @@ export async function registerRoutes(
       });
     }
 
-    // Check if any playing entries remain (shouldn't after completing all)
     const remainingQueue = await storage.getActiveQueueForTable(table.id);
     const stillPlaying = remainingQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
 
@@ -420,24 +366,12 @@ export async function registerRoutes(
 
     // Reposition remaining
     const remaining = await storage.getActiveQueueForTable(table.id);
-    remaining.forEach((e, i) => {
-      storage.updateQueueEntry(e.id, { position: i + 1 });
-    });
-
-    broadcastToTable(table.id, {
-      type: "session_ended",
-      payload: { tableId: table.id },
-      timestamp: new Date().toISOString(),
-    });
+    for (let i = 0; i < remaining.length; i++) {
+      await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+    }
 
     // Notify next in queue
     await notifyNextInQueue(table.id);
-
-    broadcastToTable(table.id, {
-      type: "queue_updated",
-      payload: { tableId: table.id },
-      timestamp: new Date().toISOString(),
-    });
 
     res.json({ success: true });
   });
@@ -455,11 +389,6 @@ export async function registerRoutes(
     const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
     if (alreadyInQueue) return res.status(400).json({ message: "Пользователь уже в очереди" });
     const entry = await storage.addToQueue(tableId, user.id, eventId);
-    broadcastToTable(tableId, {
-      type: "queue_updated",
-      payload: { tableId },
-      timestamp: new Date().toISOString(),
-    });
     if (table.status === TableStatus.FREE && entry.position === 1) {
       await notifyNextInQueue(tableId);
     }
@@ -471,15 +400,10 @@ export async function registerRoutes(
     const { entryIds } = req.body;
     if (!Array.isArray(entryIds)) return res.status(400).json({ message: "entryIds required" });
     await storage.reorderQueue(req.params.tableId, entryIds);
-    broadcastToTable(req.params.tableId, {
-      type: "queue_updated",
-      payload: { tableId: req.params.tableId },
-      timestamp: new Date().toISOString(),
-    });
     res.json({ success: true });
   });
 
-  // Manager: skip user (force remove)
+  // Manager: skip user
   app.post("/api/queue/:entryId/skip", async (req, res) => {
     const entry = await storage.getQueueEntry(req.params.entryId);
     if (!entry) return res.status(404).json({ message: "Запись не найдена" });
@@ -495,23 +419,10 @@ export async function registerRoutes(
       completedAt: new Date().toISOString(),
     });
 
-    // Reposition
     const active = await storage.getActiveQueueForTable(entry.tableId);
-    active.forEach((e, i) => {
-      storage.updateQueueEntry(e.id, { position: i + 1 });
-    });
-
-    broadcastToUser(entry.userId, {
-      type: "removed_from_queue",
-      payload: { entryId: entry.id, tableId: entry.tableId, reason: "skipped" },
-      timestamp: new Date().toISOString(),
-    });
-
-    broadcastToTable(entry.tableId, {
-      type: "queue_updated",
-      payload: { tableId: entry.tableId },
-      timestamp: new Date().toISOString(),
-    });
+    for (let i = 0; i < active.length; i++) {
+      await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+    }
 
     res.json({ success: true });
   });
@@ -539,7 +450,6 @@ export async function registerRoutes(
     res.type("image/svg+xml").send(svg);
   });
 
-  // Bulk QR generation for printing
   app.get("/api/events/:eventId/qr-codes", async (req, res) => {
     const tables = await storage.getTables(req.params.eventId);
     const qrMod = await import("qrcode");
@@ -561,55 +471,58 @@ export async function registerRoutes(
     res.json(codes);
   });
 
+  // ====== TELEGRAM WEBHOOK ======
+  // Receives updates from Telegram Bot API
+  app.post("/api/telegram/webhook", async (req, res) => {
+    try {
+      const update = req.body;
+      const message = update?.message;
+      if (!message?.text) {
+        return res.json({ ok: true });
+      }
+
+      const chatId = String(message.chat.id);
+      const text = message.text.trim();
+
+      // Handle /start with payload: /start queue_<queueEntryId>
+      if (text.startsWith("/start")) {
+        const parts = text.split(" ");
+        if (parts.length >= 2 && parts[1].startsWith("queue_")) {
+          const queueEntryId = parts[1].replace("queue_", "");
+          // Verify the queue entry exists
+          const entry = await storage.getQueueEntry(queueEntryId);
+          if (entry) {
+            await storage.saveSubscription(queueEntryId, chatId, "telegram");
+            await sendTelegramMessage(
+              chatId,
+              `✅ <b>Уведомления включены!</b>\n\nВы получите сообщение, когда подойдёт ваша очередь.\n\n🎲 Удачной игры на фестивале!`
+            );
+          } else {
+            await sendTelegramMessage(
+              chatId,
+              `❌ Запись в очереди не найдена. Попробуйте записаться заново через QR-код на столе.`
+            );
+          }
+        } else {
+          await sendTelegramMessage(
+            chatId,
+            `👋 <b>Добро пожаловать в QueueFest!</b>\n\nЯ уведомлю вас, когда подойдёт ваша очередь на фестивале настольных игр.\n\nЧтобы подписаться, запишитесь в очередь через приложение и нажмите кнопку «Уведомления в Telegram».`
+          );
+        }
+      }
+
+      res.json({ ok: true });
+    } catch (e: any) {
+      log(`Webhook error: ${e.message}`);
+      res.json({ ok: true }); // Always return 200 to Telegram
+    }
+  });
+
   // ====== KEEP-ALIVE ======
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
-  // ====== WEBSOCKET ======
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
-
-  wss.on("connection", (ws, req) => {
-    let userId: string | null = null;
-
-    ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === "auth" && msg.userId) {
-          userId = msg.userId;
-          if (!wsClients.has(userId!)) {
-            wsClients.set(userId!, new Set());
-          }
-          wsClients.get(userId!)!.add(ws);
-          log(`WS client connected: ${userId}`);
-        }
-      } catch (e) {
-        // ignore
-      }
-    });
-
-    ws.on("close", () => {
-      if (userId) {
-        const clients = wsClients.get(userId);
-        if (clients) {
-          clients.delete(ws);
-          if (clients.size === 0) {
-            wsClients.delete(userId);
-          }
-        }
-        log(`WS client disconnected: ${userId}`);
-      }
-    });
-
-    // Keepalive ping
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
-      }
-    }, 30000);
-
-    ws.on("close", () => clearInterval(pingInterval));
-  });
-
+  // No WebSocket — Supabase Realtime handles real-time updates on the client
   return httpServer;
 }

@@ -31,7 +31,7 @@ function useKeepAlive() {
   useEffect(() => {
     const interval = setInterval(() => {
       apiRequest("GET", "/api/health").catch(() => {});
-    }, 5 * 60 * 1000); // every 5 minutes
+    }, 5 * 60 * 1000);
     return () => clearInterval(interval);
   }, []);
 }

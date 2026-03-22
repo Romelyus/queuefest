@@ -1,17 +1,20 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useParams, useLocation } from "wouter";
 import { useAuth } from "@/contexts/auth-context";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTableRealtime } from "@/hooks/use-realtime";
 import { apiRequest } from "@/lib/queryClient";
 import type { GameTable, QueueEntry, Event } from "@shared/schema";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Clock, Users, ListOrdered, CheckCircle2, ArrowLeft, Dice5, AlertCircle } from "lucide-react";
+import { ListOrdered, CheckCircle2, ArrowLeft, Dice5, AlertCircle, Send } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 type TableWithQueue = GameTable & { queueLength: number; queue: QueueEntry[] };
+
+const BOT_USERNAME = import.meta.env.VITE_BOT_USERNAME || "QueueFestBot";
 
 export default function JoinQueuePage() {
   const params = useParams<{ tableId: string }>();
@@ -22,8 +25,8 @@ export default function JoinQueuePage() {
   const [braceletId, setBraceletId] = useState("");
   const [joining, setJoining] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
+  const [joinedEntryId, setJoinedEntryId] = useState<string | null>(null);
 
-  // Fetch active event
   const { data: activeEvent } = useQuery<Event | null>({
     queryKey: ["/api/events/active"],
   });
@@ -35,8 +38,14 @@ export default function JoinQueuePage() {
       return res.json();
     },
     enabled: !!params.tableId,
-    refetchInterval: 5000,
   });
+
+  // Supabase Realtime for this table
+  useTableRealtime(
+    "queue_entries",
+    [["/api/tables", params.tableId || ""]],
+    !!params.tableId
+  );
 
   const handleLogin = async () => {
     if (!braceletId) {
@@ -61,14 +70,14 @@ export default function JoinQueuePage() {
     if (!user || !table) return;
     setJoining(true);
     try {
-      await apiRequest("POST", "/api/queue/join", {
+      const res = await apiRequest("POST", "/api/queue/join", {
         tableId: table.id,
         userId: user.id,
       });
+      const entry = await res.json();
+      setJoinedEntryId(entry.id);
       toast({ title: "Записаны!", description: `Вы в очереди на «${table.gameName}»` });
       queryClient.invalidateQueries({ queryKey: ["/api/tables", params.tableId] });
-      // Small delay then navigate
-      setTimeout(() => navigate("/dashboard"), 1000);
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
     } finally {
@@ -123,7 +132,6 @@ export default function JoinQueuePage() {
                     <span>Стол: {table.tableName}</span>
                   </div>
                 </div>
-
                 <div className="flex items-center gap-2">
                   <Badge variant={table.status === "free" ? "default" : "secondary"}>
                     {table.status === "free" ? "Свободен" : table.status === "playing" ? "Идет партия" : "Пауза"}
@@ -166,6 +174,37 @@ export default function JoinQueuePage() {
                     data-testid="button-login-join"
                   >
                     {loginLoading ? "Вход..." : "Войти и записаться"}
+                  </Button>
+                </CardContent>
+              </Card>
+            ) : joinedEntryId ? (
+              /* Successfully joined — show Telegram deeplink */
+              <Card>
+                <CardContent className="p-6 text-center space-y-4">
+                  <CheckCircle2 className="w-10 h-10 text-green-500 mx-auto" />
+                  <div>
+                    <p className="text-sm font-medium">Вы записаны в очередь!</p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Получите уведомление, когда подойдёт ваша очередь
+                    </p>
+                  </div>
+                  <a
+                    href={`https://t.me/${BOT_USERNAME}?start=queue_${joinedEntryId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-[#0088cc] text-white hover:bg-[#0077b5] transition-colors text-sm font-medium"
+                    data-testid="link-telegram-notify"
+                  >
+                    <Send className="w-4 h-4" />
+                    Уведомления в Telegram
+                  </a>
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => navigate("/dashboard")}
+                    data-testid="button-go-dashboard"
+                  >
+                    Мои очереди
                   </Button>
                 </CardContent>
               </Card>

@@ -11,13 +11,13 @@ export type UserRoleType = (typeof UserRole)[keyof typeof UserRole];
 
 export const QueueEntryStatus = {
   WAITING: "waiting",
-  NOTIFIED: "notified", // user was notified it's their turn
-  CONFIRMED: "confirmed", // user confirmed they're coming
-  PLAYING: "playing", // currently at the table
+  NOTIFIED: "notified",
+  CONFIRMED: "confirmed",
+  PLAYING: "playing",
   COMPLETED: "completed",
-  CANCELLED: "cancelled", // user cancelled
-  EXPIRED: "expired", // user didn't confirm in time
-  SKIPPED: "skipped", // manager skipped
+  CANCELLED: "cancelled",
+  EXPIRED: "expired",
+  SKIPPED: "skipped",
 } as const;
 
 export type QueueEntryStatusType =
@@ -31,7 +31,58 @@ export const TableStatus = {
 
 export type TableStatusType = (typeof TableStatus)[keyof typeof TableStatus];
 
-// === Types ===
+// === Database Row Types (snake_case, matching Supabase) ===
+
+export interface DbEvent {
+  id: string;
+  name: string;
+  description: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface DbUser {
+  id: string;
+  bracelet_id: string;
+  name: string;
+  role: UserRoleType;
+  event_id: string;
+  created_at: string;
+}
+
+export interface DbGameTable {
+  id: string;
+  event_id: string;
+  table_name: string;
+  game_name: string;
+  status: TableStatusType;
+  current_session_start: string | null;
+  qr_code: string;
+}
+
+export interface DbQueueEntry {
+  id: string;
+  table_id: string;
+  user_id: string;
+  event_id: string;
+  position: number;
+  status: QueueEntryStatusType;
+  joined_at: string;
+  notified_at: string | null;
+  confirmed_at: string | null;
+  completed_at: string | null;
+  confirm_deadline: string | null;
+}
+
+export interface DbUserSubscription {
+  id: string;
+  queue_entry_id: string;
+  messenger: "telegram" | "max";
+  chat_id: string;
+  created_at: string;
+}
+
+// === Frontend-Friendly Types (camelCase, used in UI) ===
 
 export interface Event {
   id: string;
@@ -48,12 +99,12 @@ export interface GameTable {
   gameName: string;
   status: TableStatusType;
   currentSessionStart: string | null;
-  qrCode: string; // URL to join queue
+  qrCode: string;
 }
 
 export interface User {
   id: string;
-  braceletId: string; // numeric ID on bracelet
+  braceletId: string;
   name: string;
   role: UserRoleType;
   eventId: string;
@@ -71,7 +122,7 @@ export interface QueueEntry {
   notifiedAt: string | null;
   confirmedAt: string | null;
   completedAt: string | null;
-  confirmDeadline: string | null; // when the confirmation times out
+  confirmDeadline: string | null;
 }
 
 // Analytics aggregates
@@ -87,6 +138,57 @@ export interface QueueAnalytics {
   avgWaitMinutes: number;
   avgSessionMinutes: number;
   peakQueueSize: number;
+}
+
+// === Converters: DB → Frontend ===
+
+export function toEvent(row: DbEvent): Event {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    isActive: row.is_active,
+    createdAt: row.created_at,
+  };
+}
+
+export function toUser(row: DbUser): User {
+  return {
+    id: row.id,
+    braceletId: row.bracelet_id,
+    name: row.name,
+    role: row.role,
+    eventId: row.event_id,
+    createdAt: row.created_at,
+  };
+}
+
+export function toGameTable(row: DbGameTable): GameTable {
+  return {
+    id: row.id,
+    eventId: row.event_id,
+    tableName: row.table_name,
+    gameName: row.game_name,
+    status: row.status as TableStatusType,
+    currentSessionStart: row.current_session_start,
+    qrCode: row.qr_code,
+  };
+}
+
+export function toQueueEntry(row: DbQueueEntry): QueueEntry {
+  return {
+    id: row.id,
+    tableId: row.table_id,
+    userId: row.user_id,
+    eventId: row.event_id,
+    position: row.position,
+    status: row.status as QueueEntryStatusType,
+    joinedAt: row.joined_at,
+    notifiedAt: row.notified_at,
+    confirmedAt: row.confirmed_at,
+    completedAt: row.completed_at,
+    confirmDeadline: row.confirm_deadline,
+  };
 }
 
 // === Zod Schemas for validation ===
@@ -122,19 +224,15 @@ export const joinQueueSchema = z.object({
 
 export type JoinQueueInput = z.infer<typeof joinQueueSchema>;
 
-// WebSocket message types
-export type WSMessageType =
-  | "queue_updated" // queue position changed
-  | "your_turn" // it's this user's turn
-  | "confirm_timeout" // confirmation deadline approaching
-  | "session_started" // table session started
-  | "session_ended" // table session ended
-  | "queue_position" // position update
-  | "removed_from_queue" // removed by manager
-  | "table_status_changed"; // table status changed
-
-export interface WSMessage {
-  type: WSMessageType;
-  payload: Record<string, unknown>;
-  timestamp: string;
+// Supabase Database type helper (for supabase client typing)
+export interface Database {
+  public: {
+    Tables: {
+      events: { Row: DbEvent; Insert: Omit<DbEvent, "id" | "created_at">; Update: Partial<Omit<DbEvent, "id">> };
+      users: { Row: DbUser; Insert: Omit<DbUser, "id" | "created_at">; Update: Partial<Omit<DbUser, "id">> };
+      game_tables: { Row: DbGameTable; Insert: Omit<DbGameTable, "id">; Update: Partial<Omit<DbGameTable, "id">> };
+      queue_entries: { Row: DbQueueEntry; Insert: Omit<DbQueueEntry, "id" | "joined_at">; Update: Partial<Omit<DbQueueEntry, "id">> };
+      users_subscriptions: { Row: DbUserSubscription; Insert: Omit<DbUserSubscription, "id" | "created_at">; Update: Partial<Omit<DbUserSubscription, "id">> };
+    };
+  };
 }

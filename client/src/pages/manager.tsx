@@ -1,11 +1,11 @@
 import { useAuth } from "@/contexts/auth-context";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useWebSocket } from "@/hooks/use-websocket";
-import { useEffect, useState } from "react";
+import { useRealtimeWithFallback } from "@/hooks/use-realtime";
+import { useState } from "react";
 import { useLocation } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
 import type { GameTable, QueueEntry, Event } from "@shared/schema";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -20,7 +20,6 @@ import {
   LogOut,
   Dice5,
   Users,
-  Clock,
   Shield,
   AlertCircle,
 } from "lucide-react";
@@ -35,12 +34,10 @@ export default function ManagerPage() {
   const [, navigate] = useLocation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
-  const { on } = useWebSocket(user?.id);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [addUserDialog, setAddUserDialog] = useState(false);
   const [addBraceletId, setAddBraceletId] = useState("");
 
-  // Fetch the single active event
   const { data: activeEvent } = useQuery<Event | null>({
     queryKey: ["/api/events/active"],
   });
@@ -54,7 +51,6 @@ export default function ManagerPage() {
       return res.json();
     },
     enabled: !!activeEventId,
-    refetchInterval: 5000,
   });
 
   const { data: queueEntries = [], refetch: refetchQueue } = useQuery<QueueEntryEnriched[]>({
@@ -64,18 +60,17 @@ export default function ManagerPage() {
       return res.json();
     },
     enabled: !!selectedTable,
-    refetchInterval: 3000,
   });
 
-  useEffect(() => {
-    const unsub = on("queue_updated", () => {
-      if (selectedTable) refetchQueue();
-      if (activeEventId) {
-        queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
-      }
-    });
-    return unsub;
-  }, [on, selectedTable, activeEventId, refetchQueue, queryClient]);
+  // Supabase Realtime with fallback
+  useRealtimeWithFallback({
+    tables: ["queue_entries", "game_tables"],
+    queryKeys: [
+      ["/api/events", activeEventId, "tables"],
+      ["/api/tables", selectedTable || "", "queue"],
+    ],
+    enabled: !!activeEventId,
+  });
 
   const handleStartSession = async (tableId: string) => {
     try {
@@ -240,7 +235,6 @@ export default function ManagerPage() {
                 <Card><CardContent className="p-8 text-center text-muted-foreground">Выберите стол для управления очередью</CardContent></Card>
               ) : (
                 <div className="space-y-3">
-                  {/* Table controls */}
                   <Card>
                     <CardContent className="p-3 flex items-center justify-between flex-wrap gap-2">
                       <div>
@@ -289,7 +283,6 @@ export default function ManagerPage() {
                     </CardContent>
                   </Card>
 
-                  {/* Queue list */}
                   <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
                     Очередь ({queueEntries.length})
                   </h3>

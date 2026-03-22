@@ -3,8 +3,8 @@
   "buildCommand": "npm run build:vercel",
   "outputDirectory": "dist/public",
   "rewrites": [
+    { "source": "/api/telegram/webhook", "destination": "/api" },
     { "source": "/api/(.*)", "destination": "/api" },
-    { "source": "/ws", "destination": "/api" },
     { "source": "/((?!api|assets|\\.).*)", "destination": "/index.html" }
   ],
   "functions": {

@@ -1,11 +1,11 @@
 import { useAuth } from "@/contexts/auth-context";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useWebSocket } from "@/hooks/use-websocket";
+import { useRealtimeWithFallback } from "@/hooks/use-realtime";
 import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
 import type { QueueEntry, GameTable } from "@shared/schema";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -29,6 +29,7 @@ import {
   Users,
   Wifi,
   WifiOff,
+  Send,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
@@ -49,16 +50,26 @@ const statusColors: Record<string, string> = {
   playing: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-100",
 };
 
+const BOT_USERNAME = import.meta.env.VITE_BOT_USERNAME || "QueueFestBot";
+
 export default function UserDashboard() {
   const { user, logout } = useAuth();
   const [, navigate] = useLocation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
-  const { lastMessage, isConnected, on } = useWebSocket(user?.id);
   const [confirmDialogEntry, setConfirmDialogEntry] = useState<string | null>(null);
   const [confirmDeadline, setConfirmDeadline] = useState<string | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [justHandled, setJustHandled] = useState(false);
+
+  // Supabase Realtime with fallback polling
+  const { isRealtimeConnected } = useRealtimeWithFallback({
+    tables: ["queue_entries", "game_tables"],
+    queryKeys: [
+      ["/api/users", user?.id || "", "queues"],
+    ],
+    enabled: !!user,
+  });
 
   const { data: queues = [], isLoading } = useQuery<QueueEntryWithTable[]>({
     queryKey: ["/api/users", user?.id, "queues"],
@@ -67,59 +78,10 @@ export default function UserDashboard() {
       return res.json();
     },
     enabled: !!user,
-    refetchInterval: 10000,
+    // If Realtime is connected, no need for frequent polling
+    // If disconnected, the hook handles polling via invalidation
+    refetchInterval: false,
   });
-
-  // Listen for WebSocket messages
-  useEffect(() => {
-    if (!user) return;
-
-    const unsub1 = on("your_turn", (msg) => {
-      const { entryId, deadline } = msg.payload as { entryId: string; deadline: string };
-      setConfirmDialogEntry(entryId);
-      setConfirmDeadline(deadline);
-      queryClient.invalidateQueries({ queryKey: ["/api/users", user.id, "queues"] });
-      // Try browser notification
-      if ("Notification" in window && Notification.permission === "granted") {
-        new Notification("QueueFest: Ваша очередь!", {
-          body: "Подтвердите участие в течение 3 минут",
-          icon: "/dice-icon.png",
-        });
-      }
-      toast({
-        title: "Ваша очередь!",
-        description: "Подтвердите участие в течение 3 минут",
-      });
-    });
-
-    const unsub2 = on("queue_updated", () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/users", user.id, "queues"] });
-    });
-
-    const unsub3 = on("removed_from_queue", (msg) => {
-      const reason = (msg.payload as any).reason;
-      queryClient.invalidateQueries({ queryKey: ["/api/users", user.id, "queues"] });
-      toast({
-        title: reason === "skipped" ? "Вас пропустили" : "Удалены из очереди",
-        description: reason === "skipped"
-          ? "Менеджер пропустил вашу очередь"
-          : "Вы были удалены из очереди",
-        variant: "destructive",
-      });
-    });
-
-    const unsub4 = on("confirm_timeout", () => {
-      setConfirmDialogEntry(null);
-      queryClient.invalidateQueries({ queryKey: ["/api/users", user.id, "queues"] });
-      toast({
-        title: "Время вышло",
-        description: "Вы не подтвердили участие вовремя",
-        variant: "destructive",
-      });
-    });
-
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
-  }, [user, on, queryClient, toast]);
 
   // Countdown timer for confirmation
   useEffect(() => {
@@ -137,6 +99,30 @@ export default function UserDashboard() {
     }, 1000);
     return () => clearInterval(interval);
   }, [confirmDeadline]);
+
+  // Detect notified entries (show confirmation dialog)
+  const notifiedEntry = queues.find((q) => q.status === "notified");
+  useEffect(() => {
+    if (notifiedEntry && !confirmDialogEntry && !justHandled) {
+      setConfirmDialogEntry(notifiedEntry.id);
+      if (notifiedEntry.confirmDeadline) {
+        setConfirmDeadline(notifiedEntry.confirmDeadline);
+      }
+      // Try browser notification
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("QueueFest: Ваша очередь!", {
+          body: "Подтвердите участие в течение 3 минут",
+        });
+      }
+      toast({
+        title: "Ваша очередь!",
+        description: "Подтвердите участие в течение 3 минут",
+      });
+    }
+    if (!notifiedEntry && justHandled) {
+      setJustHandled(false);
+    }
+  }, [notifiedEntry, confirmDialogEntry, justHandled, toast]);
 
   const handleConfirm = async (entryId: string) => {
     try {
@@ -171,20 +157,6 @@ export default function UserDashboard() {
 
   if (!user) return null;
 
-  // Check for notified entries on initial load
-  const notifiedEntry = queues.find((q) => q.status === "notified");
-  useEffect(() => {
-    if (notifiedEntry && !confirmDialogEntry && !justHandled) {
-      setConfirmDialogEntry(notifiedEntry.id);
-      if (notifiedEntry.confirmDeadline) {
-        setConfirmDeadline(notifiedEntry.confirmDeadline);
-      }
-    }
-    if (!notifiedEntry && justHandled) {
-      setJustHandled(false);
-    }
-  }, [notifiedEntry, confirmDialogEntry, justHandled]);
-
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
@@ -193,7 +165,7 @@ export default function UserDashboard() {
           <div className="flex items-center gap-2">
             <Dice5 className="w-5 h-5 text-primary" />
             <span className="font-semibold text-sm">QueueFest</span>
-            {isConnected ? (
+            {isRealtimeConnected ? (
               <Wifi className="w-3.5 h-3.5 text-green-500" />
             ) : (
               <WifiOff className="w-3.5 h-3.5 text-muted-foreground" />
@@ -307,6 +279,19 @@ export default function UserDashboard() {
                           Выйти
                         </Button>
                       )}
+                      {/* Telegram notification deeplink */}
+                      {q.status === "waiting" && (
+                        <a
+                          href={`https://t.me/${BOT_USERNAME}?start=queue_${q.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center justify-center gap-1 text-xs px-2.5 py-1.5 rounded-md border bg-[#0088cc]/10 text-[#0088cc] hover:bg-[#0088cc]/20 transition-colors"
+                          data-testid={`link-telegram-${q.id}`}
+                        >
+                          <Send className="w-3 h-3" />
+                          Telegram
+                        </a>
+                      )}
                     </div>
                   </div>
                 </CardContent>
@@ -324,7 +309,7 @@ export default function UserDashboard() {
             data-testid="button-enable-notifications"
           >
             <Bell className="w-4 h-4 mr-2" />
-            Включить уведомления
+            Включить уведомления в браузере
           </Button>
         )}
       </main>
