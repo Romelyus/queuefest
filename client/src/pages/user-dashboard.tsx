@@ -30,6 +30,8 @@ import {
   Wifi,
   WifiOff,
   Send,
+  Play,
+  Square,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
@@ -62,6 +64,9 @@ export default function UserDashboard() {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [justHandled, setJustHandled] = useState(false);
 
+  // Walk countdown timers (per entry)
+  const [walkCountdowns, setWalkCountdowns] = useState<Record<string, number>>({});
+
   // Supabase Realtime with fallback polling
   const { isRealtimeConnected } = useRealtimeWithFallback({
     tables: ["queue_entries", "game_tables"],
@@ -78,12 +83,20 @@ export default function UserDashboard() {
       return res.json();
     },
     enabled: !!user,
-    // If Realtime is connected, no need for frequent polling
-    // If disconnected, the hook handles polling via invalidation
     refetchInterval: false,
   });
 
-  // Countdown timer for confirmation
+  // Check Telegram subscription status
+  const { data: telegramSub } = useQuery<{ chat_id: string; messenger: string } | null>({
+    queryKey: ["/api/users", user?.id, "subscription"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/users/${user!.id}/subscription`);
+      return res.json();
+    },
+    enabled: !!user,
+  });
+
+  // Countdown timer for confirmation dialog
   useEffect(() => {
     if (!confirmDeadline) {
       setCountdown(null);
@@ -99,6 +112,37 @@ export default function UserDashboard() {
     }, 1000);
     return () => clearInterval(interval);
   }, [confirmDeadline]);
+
+  // Walk timer countdowns for confirmed entries
+  useEffect(() => {
+    const confirmedEntries = queues.filter((q) => q.status === "confirmed" && q.walkDeadline);
+    if (confirmedEntries.length === 0) {
+      setWalkCountdowns({});
+      return;
+    }
+
+    const interval = setInterval(() => {
+      const newCountdowns: Record<string, number> = {};
+      for (const entry of confirmedEntries) {
+        if (entry.walkDeadline) {
+          const remaining = Math.max(0, Math.floor((new Date(entry.walkDeadline).getTime() - Date.now()) / 1000));
+          newCountdowns[entry.id] = remaining;
+        }
+      }
+      setWalkCountdowns(newCountdowns);
+    }, 1000);
+
+    // Run immediately
+    const initial: Record<string, number> = {};
+    for (const entry of confirmedEntries) {
+      if (entry.walkDeadline) {
+        initial[entry.id] = Math.max(0, Math.floor((new Date(entry.walkDeadline).getTime() - Date.now()) / 1000));
+      }
+    }
+    setWalkCountdowns(initial);
+
+    return () => clearInterval(interval);
+  }, [queues]);
 
   // Detect notified entries (show confirmation dialog)
   const notifiedEntry = queues.find((q) => q.status === "notified");
@@ -131,7 +175,7 @@ export default function UserDashboard() {
       setConfirmDialogEntry(null);
       setConfirmDeadline(null);
       queryClient.invalidateQueries({ queryKey: ["/api/users", user!.id, "queues"] });
-      toast({ title: "Подтверждено", description: "Идите к столу!" });
+      toast({ title: "Подтверждено", description: "Идите к столу! У вас 3 минуты." });
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
     }
@@ -145,6 +189,26 @@ export default function UserDashboard() {
       setConfirmDeadline(null);
       queryClient.invalidateQueries({ queryKey: ["/api/users", user!.id, "queues"] });
       toast({ title: "Отменено", description: "Вы вышли из очереди" });
+    } catch (e: any) {
+      toast({ title: "Ошибка", description: e.message, variant: "destructive" });
+    }
+  };
+
+  const handleStartPlaying = async (entryId: string) => {
+    try {
+      await apiRequest("POST", `/api/queue/${entryId}/start-playing`);
+      queryClient.invalidateQueries({ queryKey: ["/api/users", user!.id, "queues"] });
+      toast({ title: "Партия началась", description: "Приятной игры!" });
+    } catch (e: any) {
+      toast({ title: "Ошибка", description: e.message, variant: "destructive" });
+    }
+  };
+
+  const handleFinishPlaying = async (entryId: string) => {
+    try {
+      await apiRequest("POST", `/api/queue/${entryId}/finish-playing`);
+      queryClient.invalidateQueries({ queryKey: ["/api/users", user!.id, "queues"] });
+      toast({ title: "Партия завершена", description: "Спасибо за игру!" });
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
     }
@@ -187,6 +251,30 @@ export default function UserDashboard() {
           <h2 className="text-lg font-semibold">Мои очереди</h2>
           <p className="text-sm text-muted-foreground">Управляйте записями и следите за статусом</p>
         </div>
+
+        {/* Telegram subscription banner */}
+        {!telegramSub && queues.length > 0 && (
+          <a
+            href={`https://t.me/${BOT_USERNAME}?start=user_${user.id}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-3 p-3 rounded-lg border bg-[#0088cc]/5 hover:bg-[#0088cc]/10 transition-colors"
+            data-testid="link-telegram-subscribe"
+          >
+            <Send className="w-5 h-5 text-[#0088cc] shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-[#0088cc]">Уведомления в Telegram</p>
+              <p className="text-xs text-muted-foreground">Получайте уведомления по всем очередям</p>
+            </div>
+          </a>
+        )}
+
+        {telegramSub && (
+          <div className="flex items-center gap-2 p-2 rounded-lg bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-300 text-xs">
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            <span>Telegram-уведомления подключены</span>
+          </div>
+        )}
 
         {isLoading ? (
           <div className="space-y-3">
@@ -244,9 +332,19 @@ export default function UserDashboard() {
                         </div>
                       )}
                       {q.status === "confirmed" && (
-                        <div className="flex items-center gap-1 mt-1.5 text-xs text-green-700 dark:text-green-300">
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>Идите к столу</span>
+                        <div className="mt-1.5 space-y-1">
+                          <div className="flex items-center gap-1 text-xs text-green-700 dark:text-green-300">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>Идите к столу</span>
+                          </div>
+                          {walkCountdowns[q.id] !== undefined && walkCountdowns[q.id] > 0 && (
+                            <div className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                              <Timer className="w-3.5 h-3.5" />
+                              <span>
+                                Осталось: {Math.floor(walkCountdowns[q.id] / 60)}:{String(walkCountdowns[q.id] % 60).padStart(2, "0")}
+                              </span>
+                            </div>
+                          )}
                         </div>
                       )}
                       {q.status === "playing" && (
@@ -267,6 +365,27 @@ export default function UserDashboard() {
                           Иду!
                         </Button>
                       )}
+                      {q.status === "confirmed" && (
+                        <Button
+                          size="sm"
+                          onClick={() => handleStartPlaying(q.id)}
+                          data-testid={`button-start-playing-${q.id}`}
+                        >
+                          <Play className="w-3.5 h-3.5 mr-1" />
+                          Начать
+                        </Button>
+                      )}
+                      {q.status === "playing" && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => handleFinishPlaying(q.id)}
+                          data-testid={`button-finish-playing-${q.id}`}
+                        >
+                          <Square className="w-3.5 h-3.5 mr-1" />
+                          Завершить
+                        </Button>
+                      )}
                       {(q.status === "waiting" || q.status === "notified") && (
                         <Button
                           size="sm"
@@ -278,19 +397,6 @@ export default function UserDashboard() {
                           <XCircle className="w-3.5 h-3.5 mr-1" />
                           Выйти
                         </Button>
-                      )}
-                      {/* Telegram notification deeplink */}
-                      {q.status === "waiting" && (
-                        <a
-                          href={`https://t.me/${BOT_USERNAME}?start=queue_${q.id}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center justify-center gap-1 text-xs px-2.5 py-1.5 rounded-md border bg-[#0088cc]/10 text-[#0088cc] hover:bg-[#0088cc]/20 transition-colors"
-                          data-testid={`link-telegram-${q.id}`}
-                        >
-                          <Send className="w-3 h-3" />
-                          Telegram
-                        </a>
                       )}
                     </div>
                   </div>

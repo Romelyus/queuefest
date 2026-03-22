@@ -2,9 +2,8 @@
 // api/index.ts
 import express from "express";
 import { createServer } from "http";
-
-// server/supabase.ts
 import { createClient } from "@supabase/supabase-js";
+import { z } from "zod";
 var supabaseUrl = process.env.SUPABASE_URL || "";
 var supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 if (!supabaseUrl || !supabaseServiceKey) {
@@ -19,9 +18,6 @@ if (!supabaseUrl || !supabaseServiceKey) {
 var supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
   auth: { persistSession: false, autoRefreshToken: false }
 });
-
-// shared/schema.ts
-import { z } from "zod";
 var UserRole = {
   USER: "user",
   MANAGER: "manager",
@@ -103,8 +99,6 @@ var joinQueueSchema = z.object({
   tableId: z.string().min(1),
   userId: z.string().min(1)
 });
-
-// server/storage.ts
 var db = supabaseAdmin;
 var ACTIVE_STATUSES = [
   QueueEntryStatus.WAITING,
@@ -361,8 +355,6 @@ var SupabaseStorage = class {
   }
 };
 var storage = new SupabaseStorage();
-
-// server/log.ts
 function log(message, source = "express") {
   const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
     hour: "numeric",
@@ -372,8 +364,6 @@ function log(message, source = "express") {
   });
   console.log(`${formattedTime} [${source}] ${message}`);
 }
-
-// server/routes.ts
 var BOT_TOKEN = process.env.BOT_TOKEN || "";
 async function sendTelegramMessage(chatId, text) {
   if (!BOT_TOKEN) {
@@ -806,8 +796,6 @@ async function registerRoutes(httpServer2, app2) {
   });
   return httpServer2;
 }
-
-// api/index.ts
 var app = express();
 var httpServer = createServer(app);
 app.use(express.json());

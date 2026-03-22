@@ -25,7 +25,7 @@ export default function JoinQueuePage() {
   const [braceletId, setBraceletId] = useState("");
   const [joining, setJoining] = useState(false);
   const [loginLoading, setLoginLoading] = useState(false);
-  const [joinedEntryId, setJoinedEntryId] = useState<string | null>(null);
+  const [joined, setJoined] = useState(false);
 
   const { data: activeEvent } = useQuery<Event | null>({
     queryKey: ["/api/events/active"],
@@ -70,12 +70,11 @@ export default function JoinQueuePage() {
     if (!user || !table) return;
     setJoining(true);
     try {
-      const res = await apiRequest("POST", "/api/queue/join", {
+      await apiRequest("POST", "/api/queue/join", {
         tableId: table.id,
         userId: user.id,
       });
-      const entry = await res.json();
-      setJoinedEntryId(entry.id);
+      setJoined(true);
       toast({ title: "Записаны!", description: `Вы в очереди на «${table.gameName}»` });
       queryClient.invalidateQueries({ queryKey: ["/api/tables", params.tableId] });
     } catch (e: any) {
@@ -177,8 +176,8 @@ export default function JoinQueuePage() {
                   </Button>
                 </CardContent>
               </Card>
-            ) : joinedEntryId ? (
-              /* Successfully joined — show Telegram deeplink */
+            ) : joined ? (
+              /* Successfully joined — show Telegram deeplink (per-user) */
               <Card>
                 <CardContent className="p-6 text-center space-y-4">
                   <CheckCircle2 className="w-10 h-10 text-green-500 mx-auto" />
@@ -189,7 +188,7 @@ export default function JoinQueuePage() {
                     </p>
                   </div>
                   <a
-                    href={`https://t.me/${BOT_USERNAME}?start=queue_${joinedEntryId}`}
+                    href={`https://t.me/${BOT_USERNAME}?start=user_${user!.id}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-[#0088cc] text-white hover:bg-[#0077b5] transition-colors text-sm font-medium"

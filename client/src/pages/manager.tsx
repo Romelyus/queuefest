@@ -22,6 +22,7 @@ import {
   Users,
   Shield,
   AlertCircle,
+  Settings2,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
@@ -37,6 +38,8 @@ export default function ManagerPage() {
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [addUserDialog, setAddUserDialog] = useState(false);
   const [addBraceletId, setAddBraceletId] = useState("");
+  const [settingsDialog, setSettingsDialog] = useState(false);
+  const [maxParallelGames, setMaxParallelGames] = useState(1);
 
   const { data: activeEvent } = useQuery<Event | null>({
     queryKey: ["/api/events/active"],
@@ -83,9 +86,20 @@ export default function ManagerPage() {
     }
   };
 
-  const handleEndSession = async (tableId: string) => {
+  const handleEndAllSessions = async (tableId: string) => {
     try {
       await apiRequest("POST", `/api/tables/${tableId}/end-session`);
+      queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
+      refetchQueue();
+      toast({ title: "Все партии завершены" });
+    } catch (e: any) {
+      toast({ title: "Ошибка", description: e.message, variant: "destructive" });
+    }
+  };
+
+  const handleEndOneSession = async (entryId: string) => {
+    try {
+      await apiRequest("POST", `/api/queue/${entryId}/end-session`);
       queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
       refetchQueue();
       toast({ title: "Партия завершена" });
@@ -144,6 +158,20 @@ export default function ManagerPage() {
     }
   };
 
+  const handleSaveSettings = async () => {
+    if (!selectedTable) return;
+    try {
+      await apiRequest("PATCH", `/api/tables/${selectedTable}`, {
+        maxParallelGames,
+      });
+      queryClient.invalidateQueries({ queryKey: ["/api/events", activeEventId, "tables"] });
+      setSettingsDialog(false);
+      toast({ title: "Настройки сохранены" });
+    } catch (e: any) {
+      toast({ title: "Ошибка", description: e.message, variant: "destructive" });
+    }
+  };
+
   const handleLogout = () => {
     logout();
     navigate("/");
@@ -156,6 +184,9 @@ export default function ManagerPage() {
   }
 
   const currentTable = tables.find((t) => t.id === selectedTable);
+  const playingEntries = queueEntries.filter((e) => e.status === "playing");
+  const confirmedEntries = queueEntries.filter((e) => e.status === "confirmed");
+  const waitingEntries = queueEntries.filter((e) => e.status === "waiting" || e.status === "notified");
 
   return (
     <div className="min-h-screen bg-background">
@@ -198,32 +229,35 @@ export default function ManagerPage() {
             {/* Tables list */}
             <div className="space-y-2">
               <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Столы</h3>
-              {tables.map((t) => (
-                <Card
-                  key={t.id}
-                  className={`cursor-pointer transition-colors ${selectedTable === t.id ? "ring-2 ring-primary" : ""}`}
-                  onClick={() => setSelectedTable(t.id)}
-                  data-testid={`card-table-${t.id}`}
-                >
-                  <CardContent className="p-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-sm font-medium">{t.gameName}</p>
-                        <p className="text-xs text-muted-foreground">{t.tableName}</p>
+              {tables.map((t) => {
+                const tPlayingCount = t.queue?.filter((e: any) => e.status === "playing").length || 0;
+                return (
+                  <Card
+                    key={t.id}
+                    className={`cursor-pointer transition-colors ${selectedTable === t.id ? "ring-2 ring-primary" : ""}`}
+                    onClick={() => setSelectedTable(t.id)}
+                    data-testid={`card-table-${t.id}`}
+                  >
+                    <CardContent className="p-3">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-medium">{t.gameName}</p>
+                          <p className="text-xs text-muted-foreground">{t.tableName}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Badge variant={t.status === "free" ? "default" : "secondary"} className="text-xs">
+                            {t.status === "free" ? "Свободен" : t.status === "playing" ? `Играют (${tPlayingCount}/${t.maxParallelGames})` : "Пауза"}
+                          </Badge>
+                          <Badge variant="outline" className="text-xs">
+                            <Users className="w-3 h-3 mr-1" />
+                            {t.queueLength}
+                          </Badge>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <Badge variant={t.status === "free" ? "default" : "secondary"} className="text-xs">
-                          {t.status === "free" ? "Свободен" : t.status === "playing" ? "Играют" : "Пауза"}
-                        </Badge>
-                        <Badge variant="outline" className="text-xs">
-                          <Users className="w-3 h-3 mr-1" />
-                          {t.queueLength}
-                        </Badge>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
+                    </CardContent>
+                  </Card>
+                );
+              })}
               {tables.length === 0 && (
                 <p className="text-sm text-muted-foreground p-4">Столы не созданы</p>
               )}
@@ -235,20 +269,24 @@ export default function ManagerPage() {
                 <Card><CardContent className="p-8 text-center text-muted-foreground">Выберите стол для управления очередью</CardContent></Card>
               ) : (
                 <div className="space-y-3">
+                  {/* Table header with controls */}
                   <Card>
                     <CardContent className="p-3 flex items-center justify-between flex-wrap gap-2">
                       <div>
                         <p className="font-medium text-sm">{currentTable?.gameName}</p>
-                        <p className="text-xs text-muted-foreground">{currentTable?.tableName}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {currentTable?.tableName} · макс. партий: {currentTable?.maxParallelGames || 1}
+                        </p>
                       </div>
-                      <div className="flex gap-2">
+                      <div className="flex gap-2 flex-wrap">
                         {(() => {
-                          const playingCount = queueEntries.filter(e => e.status === "playing").length;
-                          const hasConfirmed = queueEntries.some(e => e.status === "confirmed");
-                          const canStartAnother = playingCount < 2 && hasConfirmed;
+                          const maxSlots = currentTable?.maxParallelGames || 1;
+                          const playingCount = playingEntries.length;
+                          const hasConfirmed = confirmedEntries.length > 0;
+                          const canStartAnother = playingCount < maxSlots && hasConfirmed;
                           return (
                             <>
-                              {(currentTable?.status === "free" || currentTable?.status === "paused" || canStartAnother) && (
+                              {(currentTable?.status === "free" || currentTable?.status === "paused" || canStartAnother) && hasConfirmed && (
                                 <Button
                                   size="sm"
                                   onClick={() => handleStartSession(selectedTable)}
@@ -258,12 +296,12 @@ export default function ManagerPage() {
                                   {playingCount > 0 ? "Ещё партию" : "Начать партию"}
                                 </Button>
                               )}
-                              {currentTable?.status === "playing" && (
+                              {playingEntries.length > 1 && (
                                 <Button
                                   size="sm"
                                   variant="secondary"
-                                  onClick={() => handleEndSession(selectedTable)}
-                                  data-testid="button-end-session"
+                                  onClick={() => handleEndAllSessions(selectedTable)}
+                                  data-testid="button-end-all-sessions"
                                 >
                                   <Square className="w-3.5 h-3.5 mr-1" /> Завершить все
                                 </Button>
@@ -279,18 +317,99 @@ export default function ManagerPage() {
                         >
                           <UserPlus className="w-3.5 h-3.5 mr-1" /> Добавить
                         </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => {
+                            setMaxParallelGames(currentTable?.maxParallelGames || 1);
+                            setSettingsDialog(true);
+                          }}
+                          data-testid="button-table-settings"
+                        >
+                          <Settings2 className="w-3.5 h-3.5" />
+                        </Button>
                       </div>
                     </CardContent>
                   </Card>
 
+                  {/* Playing entries */}
+                  {playingEntries.length > 0 && (
+                    <>
+                      <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+                        Играют ({playingEntries.length}/{currentTable?.maxParallelGames || 1})
+                      </h3>
+                      <div className="space-y-1.5">
+                        {playingEntries.map((entry) => (
+                          <Card key={entry.id} className="border-blue-200 dark:border-blue-800">
+                            <CardContent className="p-3 flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-3">
+                                <div>
+                                  <p className="text-sm font-medium">{entry.userName || "—"}</p>
+                                  <p className="text-xs text-muted-foreground">#{entry.braceletId}</p>
+                                </div>
+                                <Badge className="text-xs bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-100">
+                                  Играет
+                                </Badge>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => handleEndOneSession(entry.id)}
+                                data-testid={`button-end-session-${entry.id}`}
+                              >
+                                <Square className="w-3.5 h-3.5 mr-1" /> Завершить
+                              </Button>
+                            </CardContent>
+                          </Card>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {/* Confirmed entries */}
+                  {confirmedEntries.length > 0 && (
+                    <>
+                      <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+                        Подтвердили ({confirmedEntries.length})
+                      </h3>
+                      <div className="space-y-1.5">
+                        {confirmedEntries.map((entry) => (
+                          <Card key={entry.id} className="border-green-200 dark:border-green-800">
+                            <CardContent className="p-3 flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-3">
+                                <div>
+                                  <p className="text-sm font-medium">{entry.userName || "—"}</p>
+                                  <p className="text-xs text-muted-foreground">#{entry.braceletId}</p>
+                                </div>
+                                <Badge className="text-xs bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100">
+                                  Подтвердил
+                                </Badge>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="text-destructive"
+                                onClick={() => handleSkip(entry.id)}
+                                data-testid={`button-skip-${entry.id}`}
+                              >
+                                <XCircle className="w-3.5 h-3.5 mr-1" /> Пропустить
+                              </Button>
+                            </CardContent>
+                          </Card>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {/* Queue (waiting + notified) */}
                   <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
-                    Очередь ({queueEntries.length})
+                    Очередь ({waitingEntries.length})
                   </h3>
-                  {queueEntries.length === 0 ? (
+                  {waitingEntries.length === 0 ? (
                     <Card><CardContent className="p-6 text-center text-sm text-muted-foreground">Очередь пуста</CardContent></Card>
                   ) : (
                     <div className="space-y-1.5">
-                      {queueEntries.map((entry, index) => (
+                      {waitingEntries.map((entry, index) => (
                         <Card key={entry.id}>
                           <CardContent className="p-3 flex items-center justify-between gap-2">
                             <div className="flex items-center gap-3">
@@ -303,9 +422,7 @@ export default function ManagerPage() {
                               </div>
                               <Badge variant="outline" className="text-xs">
                                 {entry.status === "waiting" ? "Ждет" :
-                                 entry.status === "notified" ? "Уведомлен" :
-                                 entry.status === "confirmed" ? "Подтвердил" :
-                                 entry.status === "playing" ? "Играет" : entry.status}
+                                 entry.status === "notified" ? "Уведомлен" : entry.status}
                               </Badge>
                             </div>
                             <div className="flex items-center gap-1">
@@ -314,7 +431,7 @@ export default function ManagerPage() {
                                 size="icon"
                                 className="h-7 w-7"
                                 disabled={index === 0}
-                                onClick={() => handleMoveUp(index)}
+                                onClick={() => handleMoveUp(queueEntries.indexOf(entry))}
                                 data-testid={`button-move-up-${entry.id}`}
                               >
                                 <ChevronUp className="w-3.5 h-3.5" />
@@ -323,8 +440,8 @@ export default function ManagerPage() {
                                 variant="ghost"
                                 size="icon"
                                 className="h-7 w-7"
-                                disabled={index === queueEntries.length - 1}
-                                onClick={() => handleMoveDown(index)}
+                                disabled={index === waitingEntries.length - 1}
+                                onClick={() => handleMoveDown(queueEntries.indexOf(entry))}
                                 data-testid={`button-move-down-${entry.id}`}
                               >
                                 <ChevronDown className="w-3.5 h-3.5" />
@@ -372,6 +489,42 @@ export default function ManagerPage() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setAddUserDialog(false)}>Отмена</Button>
             <Button onClick={handleForceAdd} disabled={!addBraceletId}>Добавить</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Table settings dialog */}
+      <Dialog open={settingsDialog} onOpenChange={setSettingsDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Настройки стола</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <label className="text-sm font-medium">Параллельных партий</label>
+              <p className="text-xs text-muted-foreground mb-2">Сколько игр может идти одновременно за этим столом</p>
+              <div className="flex items-center gap-3">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => setMaxParallelGames(Math.max(1, maxParallelGames - 1))}
+                  disabled={maxParallelGames <= 1}
+                >-</Button>
+                <span className="text-lg font-semibold w-8 text-center">{maxParallelGames}</span>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => setMaxParallelGames(Math.min(10, maxParallelGames + 1))}
+                  disabled={maxParallelGames >= 10}
+                >+</Button>
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSettingsDialog(false)}>Отмена</Button>
+            <Button onClick={handleSaveSettings}>Сохранить</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

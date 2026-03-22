@@ -38,52 +38,128 @@ async function sendTelegramMessage(chatId: string, text: string): Promise<boolea
   }
 }
 
-// Confirmation timeout: 3 minutes
+// Confirmation timeout: 3 minutes (for notification confirmation)
 const CONFIRM_TIMEOUT_MS = 3 * 60 * 1000;
+// Walk timeout: 3 minutes (to reach the table after confirming)
+const WALK_TIMEOUT_MS = 3 * 60 * 1000;
+
 const confirmTimers = new Map<string, NodeJS.Timeout>();
+const walkTimers = new Map<string, NodeJS.Timeout>();
 
 async function notifyNextInQueue(tableId: string) {
-  const next = await storage.getNextInQueue(tableId);
-  if (!next) return;
+  // Check how many slots are available
+  const table = await storage.getTable(tableId);
+  if (!table) return;
 
-  const deadline = new Date(Date.now() + CONFIRM_TIMEOUT_MS).toISOString();
-  await storage.updateQueueEntry(next.id, {
-    status: QueueEntryStatus.NOTIFIED,
-    notifiedAt: new Date().toISOString(),
-    confirmDeadline: deadline,
-  });
+  const maxSlots = table.maxParallelGames || 1;
+  const allQueue = await storage.getActiveQueueForTableWithPlaying(tableId);
+  const playingCount = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+  const confirmedCount = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+  const notifiedCount = allQueue.filter((e) => e.status === QueueEntryStatus.NOTIFIED).length;
 
-  // Try to send Telegram notification
-  const sub = await storage.getSubscription(next.id);
-  if (sub?.chat_id) {
-    const table = await storage.getTable(next.tableId);
-    const gameName = table?.gameName || "игра";
-    const tableName = table?.tableName || "стол";
-    await sendTelegramMessage(
-      sub.chat_id,
-      `🎲 <b>Ваша очередь подошла!</b>\n\nИгра: ${gameName}\nСтол: ${tableName}\n\nПодойдите к столу в течение 3 минут.`
-    );
-  }
+  // Available slots = max - playing - confirmed - notified (people already on their way)
+  const occupiedSlots = playingCount + confirmedCount + notifiedCount;
+  const availableSlots = maxSlots - occupiedSlots;
 
-  // Set confirmation timeout
-  const timer = setTimeout(async () => {
-    const entry = await storage.getQueueEntry(next.id);
-    if (entry && entry.status === QueueEntryStatus.NOTIFIED) {
-      await storage.updateQueueEntry(next.id, {
-        status: QueueEntryStatus.EXPIRED,
-        completedAt: new Date().toISOString(),
-      });
-      // Reposition remaining and notify next person
-      const active = await storage.getActiveQueueForTable(tableId);
-      for (let i = 0; i < active.length; i++) {
-        await storage.updateQueueEntry(active[i].id, { position: i + 1 });
-      }
-      await notifyNextInQueue(tableId);
+  if (availableSlots <= 0) return;
+
+  // Notify as many waiting users as we have available slots
+  const waiting = allQueue.filter((e) => e.status === QueueEntryStatus.WAITING);
+  const toNotify = waiting.slice(0, availableSlots);
+
+  for (const next of toNotify) {
+    const deadline = new Date(Date.now() + CONFIRM_TIMEOUT_MS).toISOString();
+    await storage.updateQueueEntry(next.id, {
+      status: QueueEntryStatus.NOTIFIED,
+      notifiedAt: new Date().toISOString(),
+      confirmDeadline: deadline,
+    });
+
+    // Try to send Telegram notification (subscription is per-user now)
+    const sub = await storage.getSubscriptionByUserId(next.userId);
+    if (sub?.chat_id) {
+      const gameName = table.gameName || "игра";
+      const tableName = table.tableName || "стол";
+      await sendTelegramMessage(
+        sub.chat_id,
+        `🎲 <b>Ваша очередь подошла!</b>\n\nИгра: ${gameName}\nСтол: ${tableName}\n\nПодойдите к столу в течение 3 минут.`
+      );
     }
-    confirmTimers.delete(next.id);
-  }, CONFIRM_TIMEOUT_MS);
 
-  confirmTimers.set(next.id, timer);
+    // Set confirmation timeout
+    const timer = setTimeout(async () => {
+      try {
+        const entry = await storage.getQueueEntry(next.id);
+        if (entry && entry.status === QueueEntryStatus.NOTIFIED) {
+          await storage.updateQueueEntry(next.id, {
+            status: QueueEntryStatus.EXPIRED,
+            completedAt: new Date().toISOString(),
+          });
+          // Reposition remaining and notify next person
+          const active = await storage.getActiveQueueForTable(tableId);
+          for (let i = 0; i < active.length; i++) {
+            await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+          }
+          await notifyNextInQueue(tableId);
+        }
+      } catch (err: any) {
+        log(`Confirm timer error: ${err.message}`);
+      }
+      confirmTimers.delete(next.id);
+    }, CONFIRM_TIMEOUT_MS);
+
+    confirmTimers.set(next.id, timer);
+  }
+}
+
+// Start walk timer after user confirms
+function startWalkTimer(entryId: string, tableId: string) {
+  const timer = setTimeout(async () => {
+    try {
+      const entry = await storage.getQueueEntry(entryId);
+      if (entry && entry.status === QueueEntryStatus.CONFIRMED) {
+        // User didn't start the game within 3 minutes — expire them
+        await storage.updateQueueEntry(entryId, {
+          status: QueueEntryStatus.EXPIRED,
+          completedAt: new Date().toISOString(),
+        });
+
+        // Send Telegram notification about expiry
+        const sub = await storage.getSubscriptionByUserId(entry.userId);
+        if (sub?.chat_id) {
+          await sendTelegramMessage(
+            sub.chat_id,
+            `⏰ <b>Время истекло</b>\n\nВы не успели подойти к столу за 3 минуты.\nЗапишитесь в очередь снова через QR-код.`
+          );
+        }
+
+        // Reposition remaining and notify next person
+        const active = await storage.getActiveQueueForTable(tableId);
+        for (let i = 0; i < active.length; i++) {
+          await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+        }
+
+        // Update table status if no one is playing/confirmed
+        const allQueue = await storage.getActiveQueueForTableWithPlaying(tableId);
+        const stillPlaying = allQueue.filter((e) =>
+          e.status === QueueEntryStatus.PLAYING || e.status === QueueEntryStatus.CONFIRMED
+        ).length;
+        if (stillPlaying === 0) {
+          await storage.updateTable(tableId, {
+            status: TableStatus.FREE,
+            currentSessionStart: null,
+          });
+        }
+
+        await notifyNextInQueue(tableId);
+      }
+    } catch (err: any) {
+      log(`Walk timer error: ${err.message}`);
+    }
+    walkTimers.delete(entryId);
+  }, WALK_TIMEOUT_MS);
+
+  walkTimers.set(entryId, timer);
 }
 
 export async function registerRoutes(
@@ -205,7 +281,7 @@ export async function registerRoutes(
     const tables = await storage.getTables(req.params.eventId);
     const tablesWithQueue = await Promise.all(
       tables.map(async (t) => {
-        const queue = await storage.getActiveQueueForTable(t.id);
+        const queue = await storage.getActiveQueueForTableWithPlaying(t.id);
         return { ...t, queueLength: queue.length, queue };
       })
     );
@@ -215,7 +291,7 @@ export async function registerRoutes(
   app.get("/api/tables/:id", async (req, res) => {
     const table = await storage.getTable(req.params.id);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
-    const queue = await storage.getActiveQueueForTable(table.id);
+    const queue = await storage.getActiveQueueForTableWithPlaying(table.id);
     res.json({ ...table, queueLength: queue.length, queue });
   });
 
@@ -230,7 +306,14 @@ export async function registerRoutes(
   });
 
   app.patch("/api/tables/:id", async (req, res) => {
-    const table = await storage.updateTable(req.params.id, req.body);
+    const updates: Record<string, unknown> = {};
+    if (req.body.tableName !== undefined) updates.tableName = req.body.tableName;
+    if (req.body.gameName !== undefined) updates.gameName = req.body.gameName;
+    if (req.body.maxParallelGames !== undefined) updates.maxParallelGames = Number(req.body.maxParallelGames);
+    if (req.body.status !== undefined) updates.status = req.body.status;
+    if (req.body.currentSessionStart !== undefined) updates.currentSessionStart = req.body.currentSessionStart;
+
+    const table = await storage.updateTable(req.params.id, updates as any);
     if (!table) return res.status(404).json({ message: "Стол не найден" });
     res.json(table);
   });
@@ -243,7 +326,7 @@ export async function registerRoutes(
 
   // ====== QUEUE ======
   app.get("/api/tables/:tableId/queue", async (req, res) => {
-    const queue = await storage.getActiveQueueForTable(req.params.tableId);
+    const queue = await storage.getActiveQueueForTableWithPlaying(req.params.tableId);
     const enriched = await Promise.all(
       queue.map(async (e) => {
         const user = await storage.getUser(e.userId);
@@ -256,6 +339,12 @@ export async function registerRoutes(
   app.get("/api/users/:userId/queues", async (req, res) => {
     const queues = await storage.getUserQueues(req.params.userId);
     res.json(queues);
+  });
+
+  // Check if user has Telegram subscription
+  app.get("/api/users/:userId/subscription", async (req, res) => {
+    const sub = await storage.getSubscriptionByUserId(req.params.userId);
+    res.json(sub || null);
   });
 
   app.post("/api/queue/join", async (req, res) => {
@@ -273,8 +362,15 @@ export async function registerRoutes(
 
       const entry = await storage.addToQueue(data.tableId, data.userId, table.eventId);
 
-      // If table is free and this is first in queue, notify immediately
-      if (table.status === TableStatus.FREE && entry.position === 1) {
+      // If table has available slots and this is first in queue, notify immediately
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(data.tableId);
+      const playingCount = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const notifiedCount = allQueue.filter((e) => e.status === QueueEntryStatus.NOTIFIED).length;
+      const confirmedCount = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      const maxSlots = table.maxParallelGames || 1;
+      const hasAvailableSlot = (playingCount + notifiedCount + confirmedCount) < maxSlots;
+
+      if (hasAvailableSlot && entry.position === 1) {
         await notifyNextInQueue(data.tableId);
       }
 
@@ -285,122 +381,293 @@ export async function registerRoutes(
   });
 
   app.post("/api/queue/:entryId/confirm", async (req, res) => {
-    const entry = await storage.getQueueEntry(req.params.entryId);
-    if (!entry) return res.status(404).json({ message: "Запись не найдена" });
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "Запись не найдена" });
 
-    if (entry.status !== QueueEntryStatus.NOTIFIED) {
-      return res.status(400).json({ message: "Подтверждение невозможно в текущем статусе" });
+      if (entry.status !== QueueEntryStatus.NOTIFIED) {
+        return res.status(400).json({ message: "Подтверждение невозможно в текущем статусе" });
+      }
+
+      const timer = confirmTimers.get(entry.id);
+      if (timer) {
+        clearTimeout(timer);
+        confirmTimers.delete(entry.id);
+      }
+
+      const walkDeadline = new Date(Date.now() + WALK_TIMEOUT_MS).toISOString();
+
+      const updated = await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.CONFIRMED,
+        confirmedAt: new Date().toISOString(),
+        walkDeadline,
+      });
+
+      // Start 3-minute walk timer
+      startWalkTimer(entry.id, entry.tableId);
+
+      res.json(updated);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
-
-    const timer = confirmTimers.get(entry.id);
-    if (timer) {
-      clearTimeout(timer);
-      confirmTimers.delete(entry.id);
-    }
-
-    const updated = await storage.updateQueueEntry(entry.id, {
-      status: QueueEntryStatus.CONFIRMED,
-      confirmedAt: new Date().toISOString(),
-    });
-
-    res.json(updated);
   });
 
   app.post("/api/queue/:entryId/cancel", async (req, res) => {
-    const entry = await storage.getQueueEntry(req.params.entryId);
-    if (!entry) return res.status(404).json({ message: "Запись не найдена" });
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "Запись не найдена" });
 
-    const timer = confirmTimers.get(entry.id);
-    if (timer) {
-      clearTimeout(timer);
-      confirmTimers.delete(entry.id);
+      const cTimer = confirmTimers.get(entry.id);
+      if (cTimer) {
+        clearTimeout(cTimer);
+        confirmTimers.delete(entry.id);
+      }
+      const wTimer = walkTimers.get(entry.id);
+      if (wTimer) {
+        clearTimeout(wTimer);
+        walkTimers.delete(entry.id);
+      }
+
+      const ok = await storage.removeFromQueue(entry.id);
+      if (!ok) return res.status(400).json({ message: "Не удалось отменить" });
+
+      // Notify next in queue
+      await notifyNextInQueue(entry.tableId);
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
-
-    const ok = await storage.removeFromQueue(entry.id);
-    if (!ok) return res.status(400).json({ message: "Не удалось отменить" });
-
-    res.json({ success: true });
   });
 
-  // Manager: start session (supports up to 2 parallel games per table)
-  app.post("/api/tables/:tableId/start-session", async (req, res) => {
-    const table = await storage.getTable(req.params.tableId);
-    if (!table) return res.status(404).json({ message: "Стол не найден" });
+  // User: start own game (confirmed → playing)
+  app.post("/api/queue/:entryId/start-playing", async (req, res) => {
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "Запись не найдена" });
 
-    const queue = await storage.getActiveQueueForTable(table.id);
-    const playingCount = queue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
-    if (playingCount >= 2) {
-      return res.status(400).json({ message: "Максимум 2 параллельных партии на столе" });
-    }
+      if (entry.status !== QueueEntryStatus.CONFIRMED) {
+        return res.status(400).json({ message: "Начать игру можно только из статуса 'подтверждено'" });
+      }
 
-    await storage.updateTable(table.id, {
-      status: TableStatus.PLAYING,
-      currentSessionStart: new Date().toISOString(),
-    });
+      // Clear walk timer
+      const wTimer = walkTimers.get(entry.id);
+      if (wTimer) {
+        clearTimeout(wTimer);
+        walkTimers.delete(entry.id);
+      }
 
-    const confirmed = queue.find((e) => e.status === QueueEntryStatus.CONFIRMED);
-    if (confirmed) {
-      await storage.updateQueueEntry(confirmed.id, {
+      await storage.updateQueueEntry(entry.id, {
         status: QueueEntryStatus.PLAYING,
+        walkDeadline: null,
       });
-    }
 
-    res.json({ success: true });
+      // Update table status to playing
+      await storage.updateTable(entry.tableId, {
+        status: TableStatus.PLAYING,
+        currentSessionStart: new Date().toISOString(),
+      });
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
-  // Manager: end session (completes all playing entries)
-  app.post("/api/tables/:tableId/end-session", async (req, res) => {
-    const table = await storage.getTable(req.params.tableId);
-    if (!table) return res.status(404).json({ message: "Стол не найден" });
+  // User: finish own game (playing → completed)
+  app.post("/api/queue/:entryId/finish-playing", async (req, res) => {
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "Запись не найдена" });
 
-    const queue = await storage.getActiveQueueForTable(table.id);
-    const playing = queue.filter((e) => e.status === QueueEntryStatus.PLAYING);
-    for (const p of playing) {
-      await storage.updateQueueEntry(p.id, {
+      if (entry.status !== QueueEntryStatus.PLAYING) {
+        return res.status(400).json({ message: "Завершить можно только активную партию" });
+      }
+
+      await storage.updateQueueEntry(entry.id, {
         status: QueueEntryStatus.COMPLETED,
         completedAt: new Date().toISOString(),
       });
+
+      // Check if anyone else is still playing at this table
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(entry.tableId);
+      const stillPlaying = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const stillConfirmed = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+
+      if (stillPlaying === 0 && stillConfirmed === 0) {
+        await storage.updateTable(entry.tableId, {
+          status: TableStatus.FREE,
+          currentSessionStart: null,
+        });
+      }
+
+      // Reposition remaining
+      const remaining = await storage.getActiveQueueForTable(entry.tableId);
+      for (let i = 0; i < remaining.length; i++) {
+        await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+      }
+
+      // Notify next in queue
+      await notifyNextInQueue(entry.tableId);
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
+  });
 
-    const remainingQueue = await storage.getActiveQueueForTable(table.id);
-    const stillPlaying = remainingQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+  // Manager: start session (move confirmed → playing, respects maxParallelGames)
+  app.post("/api/tables/:tableId/start-session", async (req, res) => {
+    try {
+      const table = await storage.getTable(req.params.tableId);
+      if (!table) return res.status(404).json({ message: "Стол не найден" });
 
-    if (stillPlaying === 0) {
+      const maxSlots = table.maxParallelGames || 1;
+      const queue = await storage.getActiveQueueForTableWithPlaying(table.id);
+      const playingCount = queue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      if (playingCount >= maxSlots) {
+        return res.status(400).json({ message: `Максимум ${maxSlots} параллельных партий на столе` });
+      }
+
       await storage.updateTable(table.id, {
-        status: TableStatus.FREE,
-        currentSessionStart: null,
+        status: TableStatus.PLAYING,
+        currentSessionStart: new Date().toISOString(),
       });
+
+      const confirmed = queue.find((e) => e.status === QueueEntryStatus.CONFIRMED);
+      if (confirmed) {
+        // Clear walk timer since manager is starting
+        const wTimer = walkTimers.get(confirmed.id);
+        if (wTimer) {
+          clearTimeout(wTimer);
+          walkTimers.delete(confirmed.id);
+        }
+        await storage.updateQueueEntry(confirmed.id, {
+          status: QueueEntryStatus.PLAYING,
+          walkDeadline: null,
+        });
+      }
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
+  });
 
-    // Reposition remaining
-    const remaining = await storage.getActiveQueueForTable(table.id);
-    for (let i = 0; i < remaining.length; i++) {
-      await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+  // Manager: end a specific entry's session
+  app.post("/api/queue/:entryId/end-session", async (req, res) => {
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "Запись не найдена" });
+
+      if (entry.status !== QueueEntryStatus.PLAYING) {
+        return res.status(400).json({ message: "Эта партия не в статусе 'играет'" });
+      }
+
+      await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.COMPLETED,
+        completedAt: new Date().toISOString(),
+      });
+
+      // Check if anyone else is still playing at this table
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(entry.tableId);
+      const stillPlaying = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const stillConfirmed = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+
+      if (stillPlaying === 0 && stillConfirmed === 0) {
+        await storage.updateTable(entry.tableId, {
+          status: TableStatus.FREE,
+          currentSessionStart: null,
+        });
+      }
+
+      // Reposition remaining
+      const remaining = await storage.getActiveQueueForTable(entry.tableId);
+      for (let i = 0; i < remaining.length; i++) {
+        await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+      }
+
+      // Notify next in queue
+      await notifyNextInQueue(entry.tableId);
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
+  });
 
-    // Notify next in queue
-    await notifyNextInQueue(table.id);
+  // Manager: end ALL playing sessions at a table
+  app.post("/api/tables/:tableId/end-session", async (req, res) => {
+    try {
+      const table = await storage.getTable(req.params.tableId);
+      if (!table) return res.status(404).json({ message: "Стол не найден" });
 
-    res.json({ success: true });
+      const queue = await storage.getActiveQueueForTableWithPlaying(table.id);
+      const playing = queue.filter((e) => e.status === QueueEntryStatus.PLAYING);
+
+      for (const p of playing) {
+        await storage.updateQueueEntry(p.id, {
+          status: QueueEntryStatus.COMPLETED,
+          completedAt: new Date().toISOString(),
+        });
+      }
+
+      const remainingQueue = await storage.getActiveQueueForTableWithPlaying(table.id);
+      const stillPlaying = remainingQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const stillConfirmed = remainingQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+
+      if (stillPlaying === 0 && stillConfirmed === 0) {
+        await storage.updateTable(table.id, {
+          status: TableStatus.FREE,
+          currentSessionStart: null,
+        });
+      }
+
+      // Reposition remaining
+      const remaining = await storage.getActiveQueueForTable(table.id);
+      for (let i = 0; i < remaining.length; i++) {
+        await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+      }
+
+      // Notify next in queue
+      await notifyNextInQueue(table.id);
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
   });
 
   // Manager: force add user to queue (auto-creates user if not found)
   app.post("/api/queue/force-add", async (req, res) => {
-    const { tableId, braceletId } = req.body;
-    const table = await storage.getTable(tableId);
-    if (!table) return res.status(404).json({ message: "Стол не найден" });
-    const eventId = table.eventId;
-    let user = await storage.getUserByBracelet(braceletId, eventId);
-    if (!user) {
-      user = await storage.createUser(braceletId, `Гость ${braceletId}`, UserRole.USER, eventId);
+    try {
+      const { tableId, braceletId } = req.body;
+      const table = await storage.getTable(tableId);
+      if (!table) return res.status(404).json({ message: "Стол не найден" });
+      const eventId = table.eventId;
+      let user = await storage.getUserByBracelet(braceletId, eventId);
+      if (!user) {
+        user = await storage.createUser(braceletId, `Гость ${braceletId}`, UserRole.USER, eventId);
+      }
+      const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
+      if (alreadyInQueue) return res.status(400).json({ message: "Пользователь уже в очереди" });
+      const entry = await storage.addToQueue(tableId, user.id, eventId);
+
+      // Check if table has available slots
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(tableId);
+      const playingCount = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const notifiedCount = allQueue.filter((e) => e.status === QueueEntryStatus.NOTIFIED).length;
+      const confirmedCount = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      const maxSlots = table.maxParallelGames || 1;
+      const hasAvailableSlot = (playingCount + notifiedCount + confirmedCount) < maxSlots;
+
+      if (hasAvailableSlot && entry.position === 1) {
+        await notifyNextInQueue(tableId);
+      }
+      res.status(201).json(entry);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
-    const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
-    if (alreadyInQueue) return res.status(400).json({ message: "Пользователь уже в очереди" });
-    const entry = await storage.addToQueue(tableId, user.id, eventId);
-    if (table.status === TableStatus.FREE && entry.position === 1) {
-      await notifyNextInQueue(tableId);
-    }
-    res.status(201).json(entry);
   });
 
   // Manager: reorder queue
@@ -413,26 +680,38 @@ export async function registerRoutes(
 
   // Manager: skip user
   app.post("/api/queue/:entryId/skip", async (req, res) => {
-    const entry = await storage.getQueueEntry(req.params.entryId);
-    if (!entry) return res.status(404).json({ message: "Запись не найдена" });
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "Запись не найдена" });
 
-    const timer = confirmTimers.get(entry.id);
-    if (timer) {
-      clearTimeout(timer);
-      confirmTimers.delete(entry.id);
+      const cTimer = confirmTimers.get(entry.id);
+      if (cTimer) {
+        clearTimeout(cTimer);
+        confirmTimers.delete(entry.id);
+      }
+      const wTimer = walkTimers.get(entry.id);
+      if (wTimer) {
+        clearTimeout(wTimer);
+        walkTimers.delete(entry.id);
+      }
+
+      await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.SKIPPED,
+        completedAt: new Date().toISOString(),
+      });
+
+      const active = await storage.getActiveQueueForTable(entry.tableId);
+      for (let i = 0; i < active.length; i++) {
+        await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+      }
+
+      // Notify next
+      await notifyNextInQueue(entry.tableId);
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
-
-    await storage.updateQueueEntry(entry.id, {
-      status: QueueEntryStatus.SKIPPED,
-      completedAt: new Date().toISOString(),
-    });
-
-    const active = await storage.getActiveQueueForTable(entry.tableId);
-    for (let i = 0; i < active.length; i++) {
-      await storage.updateQueueEntry(active[i].id, { position: i + 1 });
-    }
-
-    res.json({ success: true });
   });
 
   // ====== ANALYTICS ======
@@ -492,29 +771,29 @@ export async function registerRoutes(
       const chatId = String(message.chat.id);
       const text = message.text.trim();
 
-      // Handle /start with payload: /start queue_<queueEntryId>
+      // Handle /start with payload: /start user_<userId>
       if (text.startsWith("/start")) {
         const parts = text.split(" ");
-        if (parts.length >= 2 && parts[1].startsWith("queue_")) {
-          const queueEntryId = parts[1].replace("queue_", "");
-          // Verify the queue entry exists
-          const entry = await storage.getQueueEntry(queueEntryId);
-          if (entry) {
-            await storage.saveSubscription(queueEntryId, chatId, "telegram");
+        if (parts.length >= 2 && parts[1].startsWith("user_")) {
+          const userId = parts[1].replace("user_", "");
+          // Verify the user exists
+          const user = await storage.getUser(userId);
+          if (user) {
+            await storage.saveSubscriptionForUser(userId, chatId, "telegram");
             await sendTelegramMessage(
               chatId,
-              `✅ <b>Уведомления включены!</b>\n\nВы получите сообщение, когда подойдёт ваша очередь.\n\n🎲 Удачной игры на фестивале!`
+              `✅ <b>Уведомления включены!</b>\n\nВы получите сообщение, когда подойдёт ваша очередь на любой из столов.\n\n🎲 Удачной игры на фестивале!`
             );
           } else {
             await sendTelegramMessage(
               chatId,
-              `❌ Запись в очереди не найдена. Попробуйте записаться заново через QR-код на столе.`
+              `❌ Пользователь не найден. Попробуйте войти через приложение и нажать кнопку «Telegram».`
             );
           }
         } else {
           await sendTelegramMessage(
             chatId,
-            `👋 <b>Добро пожаловать в QueueFest!</b>\n\nЯ уведомлю вас, когда подойдёт ваша очередь на фестивале настольных игр.\n\nЧтобы подписаться, запишитесь в очередь через приложение и нажмите кнопку «Уведомления в Telegram».`
+            `👋 <b>Добро пожаловать в QueueFest!</b>\n\nЯ уведомлю вас, когда подойдёт ваша очередь на фестивале настольных игр.\n\nЧтобы подписаться, войдите в приложение и нажмите кнопку «Уведомления в Telegram».`
           );
         }
       }

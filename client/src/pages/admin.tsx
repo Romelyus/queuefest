@@ -40,7 +40,7 @@ export default function AdminPage() {
   const [createTableDialog, setCreateTableDialog] = useState(false);
   const [eventForm, setEventForm] = useState<InsertEvent>({ name: "", description: "" });
   const [tableForm, setTableForm] = useState<InsertTable>({
-    eventId: "", tableName: "", gameName: "",
+    eventId: "", tableName: "", gameName: "", maxParallelGames: 1,
   });
 
   const { data: events = [] } = useQuery<Event[]>({ queryKey: ["/api/events"] });
@@ -125,7 +125,7 @@ export default function AdminPage() {
       await apiRequest("POST", "/api/tables", { ...tableForm, eventId: selectedEvent });
       queryClient.invalidateQueries({ queryKey: ["/api/events", selectedEvent, "tables"] });
       setCreateTableDialog(false);
-      setTableForm({ eventId: "", tableName: "", gameName: "" });
+      setTableForm({ eventId: "", tableName: "", gameName: "", maxParallelGames: 1 });
       toast({ title: "Стол создан" });
     } catch (e: any) {
       toast({ title: "Ошибка", description: e.message, variant: "destructive" });
@@ -289,6 +289,7 @@ export default function AdminPage() {
                       <TableHead>Стол</TableHead>
                       <TableHead>Игра</TableHead>
                       <TableHead>Статус</TableHead>
+                      <TableHead>Партии</TableHead>
                       <TableHead>Очередь</TableHead>
                       <TableHead></TableHead>
                     </TableRow>
@@ -303,6 +304,7 @@ export default function AdminPage() {
                             {t.status === "free" ? "Свободен" : t.status === "playing" ? "Играют" : "Пауза"}
                           </Badge>
                         </TableCell>
+                        <TableCell className="text-sm">{t.maxParallelGames || 1}</TableCell>
                         <TableCell className="text-sm">{t.queueLength}</TableCell>
                         <TableCell>
                           <Button
@@ -442,6 +444,17 @@ export default function AdminPage() {
               value={tableForm.gameName}
               onChange={(e) => setTableForm({ ...tableForm, gameName: e.target.value })}
             />
+            <div>
+              <label className="text-sm font-medium">Параллельных партий (по умолчанию 1)</label>
+              <Input
+                data-testid="input-max-parallel"
+                type="number"
+                min={1}
+                max={10}
+                value={tableForm.maxParallelGames}
+                onChange={(e) => setTableForm({ ...tableForm, maxParallelGames: Math.max(1, Math.min(10, parseInt(e.target.value) || 1)) })}
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateTableDialog(false)}>Отмена</Button>

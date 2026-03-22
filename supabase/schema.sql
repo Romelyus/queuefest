@@ -41,7 +41,8 @@ create table if not exists game_tables (
   game_name             text not null,
   status                text not null default 'free' check (status in ('free','playing','paused')),
   current_session_start timestamptz,
-  qr_code               text not null default ''
+  qr_code               text not null default '',
+  max_parallel_games    integer not null default 1
 );
 
 -- ============================================================
@@ -59,7 +60,8 @@ create table if not exists queue_entries (
   notified_at      timestamptz,
   confirmed_at     timestamptz,
   completed_at     timestamptz,
-  confirm_deadline timestamptz
+  confirm_deadline timestamptz,
+  walk_deadline    timestamptz
 );
 
 -- Индекс для быстрой выборки активной очереди стола
@@ -69,15 +71,16 @@ create index if not exists idx_queue_user on queue_entries(user_id, status);
 
 -- ============================================================
 -- 5. ТАБЛИЦА: users_subscriptions (подписки на уведомления в мессенджере)
+-- Теперь привязана к user_id, а не к queue_entry_id
 -- ============================================================
 create table if not exists users_subscriptions (
   id              uuid primary key default gen_random_uuid(),
-  queue_entry_id  uuid not null references queue_entries(id) on delete cascade,
+  user_id         uuid not null references users(id) on delete cascade,
   messenger       text not null default 'telegram' check (messenger in ('telegram','max')),
   chat_id         text not null,
   created_at      timestamptz not null default now(),
-  -- Один чат — одна подписка на запись
-  unique(queue_entry_id, messenger)
+  -- Один чат — одна подписка на юзера
+  unique(user_id, messenger)
 );
 
 -- ============================================================
@@ -129,6 +132,21 @@ create policy "subs_delete" on users_subscriptions for delete using (true);
 alter publication supabase_realtime add table queue_entries;
 alter publication supabase_realtime add table game_tables;
 alter publication supabase_realtime add table events;
+
+-- ============================================================
+-- МИГРАЦИЯ: если таблицы уже существуют, добавить новые колонки
+-- ============================================================
+-- Выполните эти ALTER отдельно, если schema.sql уже был запущен ранее:
+--
+-- ALTER TABLE game_tables ADD COLUMN IF NOT EXISTS max_parallel_games integer NOT NULL DEFAULT 1;
+-- ALTER TABLE queue_entries ADD COLUMN IF NOT EXISTS walk_deadline timestamptz;
+--
+-- Для миграции users_subscriptions с queue_entry_id на user_id:
+-- ALTER TABLE users_subscriptions DROP CONSTRAINT IF EXISTS users_subscriptions_queue_entry_id_fkey;
+-- ALTER TABLE users_subscriptions DROP COLUMN IF EXISTS queue_entry_id;
+-- ALTER TABLE users_subscriptions ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users(id) ON DELETE CASCADE;
+-- ALTER TABLE users_subscriptions DROP CONSTRAINT IF EXISTS users_subscriptions_queue_entry_id_messenger_key;
+-- ALTER TABLE users_subscriptions ADD CONSTRAINT users_subscriptions_user_id_messenger_key UNIQUE (user_id, messenger);
 
 -- ============================================================
 -- Готово! Запустите этот скрипт в SQL Editor Supabase Dashboard.

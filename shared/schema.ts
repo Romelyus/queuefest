@@ -58,6 +58,7 @@ export interface DbGameTable {
   status: TableStatusType;
   current_session_start: string | null;
   qr_code: string;
+  max_parallel_games: number;
 }
 
 export interface DbQueueEntry {
@@ -72,11 +73,12 @@ export interface DbQueueEntry {
   confirmed_at: string | null;
   completed_at: string | null;
   confirm_deadline: string | null;
+  walk_deadline: string | null;
 }
 
 export interface DbUserSubscription {
   id: string;
-  queue_entry_id: string;
+  user_id: string;
   messenger: "telegram" | "max";
   chat_id: string;
   created_at: string;
@@ -100,6 +102,7 @@ export interface GameTable {
   status: TableStatusType;
   currentSessionStart: string | null;
   qrCode: string;
+  maxParallelGames: number;
 }
 
 export interface User {
@@ -123,6 +126,7 @@ export interface QueueEntry {
   confirmedAt: string | null;
   completedAt: string | null;
   confirmDeadline: string | null;
+  walkDeadline: string | null;
 }
 
 // Analytics aggregates
@@ -172,6 +176,7 @@ export function toGameTable(row: DbGameTable): GameTable {
     status: row.status as TableStatusType,
     currentSessionStart: row.current_session_start,
     qrCode: row.qr_code,
+    maxParallelGames: row.max_parallel_games ?? 1,
   };
 }
 
@@ -188,6 +193,7 @@ export function toQueueEntry(row: DbQueueEntry): QueueEntry {
     confirmedAt: row.confirmed_at,
     completedAt: row.completed_at,
     confirmDeadline: row.confirm_deadline,
+    walkDeadline: row.walk_deadline,
   };
 }
 
@@ -204,6 +210,7 @@ export const insertTableSchema = z.object({
   eventId: z.string().min(1),
   tableName: z.string().min(1, "Название стола обязательно"),
   gameName: z.string().min(1, "Название игры обязательно"),
+  maxParallelGames: z.number().int().min(1).max(10).default(1),
 });
 
 export type InsertTable = z.infer<typeof insertTableSchema>;

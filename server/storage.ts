@@ -58,6 +58,7 @@ export interface IStorage {
   // Queue
   getQueueForTable(tableId: string): Promise<QueueEntry[]>;
   getActiveQueueForTable(tableId: string): Promise<QueueEntry[]>;
+  getActiveQueueForTableWithPlaying(tableId: string): Promise<QueueEntry[]>;
   getUserQueues(userId: string): Promise<(QueueEntry & { table?: GameTable })[]>;
   addToQueue(tableId: string, userId: string, eventId: string): Promise<QueueEntry>;
   removeFromQueue(entryId: string): Promise<boolean>;
@@ -67,9 +68,9 @@ export interface IStorage {
   reorderQueue(tableId: string, entryIds: string[]): Promise<void>;
   getNextInQueue(tableId: string): Promise<QueueEntry | undefined>;
 
-  // Subscriptions
-  getSubscription(queueEntryId: string): Promise<{ chat_id: string; messenger: string } | undefined>;
-  saveSubscription(queueEntryId: string, chatId: string, messenger: string): Promise<void>;
+  // Subscriptions (now per-user, not per-queue-entry)
+  getSubscriptionByUserId(userId: string): Promise<{ chat_id: string; messenger: string } | undefined>;
+  saveSubscriptionForUser(userId: string, chatId: string, messenger: string): Promise<void>;
 
   // Analytics
   getAnalytics(eventId: string): Promise<QueueAnalytics[]>;
@@ -181,6 +182,7 @@ export class SupabaseStorage implements IStorage {
         status: TableStatus.FREE,
         current_session_start: null,
         qr_code: "", // Will be updated after insert with the ID
+        max_parallel_games: input.maxParallelGames ?? 1,
       })
       .select()
       .single();
@@ -199,6 +201,7 @@ export class SupabaseStorage implements IStorage {
     if (updates.gameName !== undefined) dbUpdates.game_name = updates.gameName;
     if (updates.status !== undefined) dbUpdates.status = updates.status;
     if (updates.currentSessionStart !== undefined) dbUpdates.current_session_start = updates.currentSessionStart;
+    if (updates.maxParallelGames !== undefined) dbUpdates.max_parallel_games = updates.maxParallelGames;
 
     const { data, error } = await db
       .from("game_tables")
@@ -273,6 +276,17 @@ export class SupabaseStorage implements IStorage {
     return (data || []).map(toQueueEntry);
   }
 
+  async getActiveQueueForTableWithPlaying(tableId: string): Promise<QueueEntry[]> {
+    const { data, error } = await db
+      .from("queue_entries")
+      .select("*")
+      .eq("table_id", tableId)
+      .in("status", ACTIVE_STATUSES_WITH_PLAYING)
+      .order("position", { ascending: true });
+    if (error) throw error;
+    return (data || []).map(toQueueEntry);
+  }
+
   async getUserQueues(userId: string): Promise<(QueueEntry & { table?: GameTable })[]> {
     const { data, error } = await db
       .from("queue_entries")
@@ -306,6 +320,7 @@ export class SupabaseStorage implements IStorage {
         confirmed_at: null,
         completed_at: null,
         confirm_deadline: null,
+        walk_deadline: null,
       })
       .select()
       .single();
@@ -338,6 +353,7 @@ export class SupabaseStorage implements IStorage {
     if (updates.confirmedAt !== undefined) dbUpdates.confirmed_at = updates.confirmedAt;
     if (updates.completedAt !== undefined) dbUpdates.completed_at = updates.completedAt;
     if (updates.confirmDeadline !== undefined) dbUpdates.confirm_deadline = updates.confirmDeadline;
+    if (updates.walkDeadline !== undefined) dbUpdates.walk_deadline = updates.walkDeadline;
 
     const { data, error } = await db
       .from("queue_entries")
@@ -390,24 +406,24 @@ export class SupabaseStorage implements IStorage {
     return data ? toQueueEntry(data) : undefined;
   }
 
-  // ============ Subscriptions ============
+  // ============ Subscriptions (per-user) ============
 
-  async getSubscription(queueEntryId: string): Promise<{ chat_id: string; messenger: string } | undefined> {
+  async getSubscriptionByUserId(userId: string): Promise<{ chat_id: string; messenger: string } | undefined> {
     const { data, error } = await db
       .from("users_subscriptions")
       .select("chat_id, messenger")
-      .eq("queue_entry_id", queueEntryId)
+      .eq("user_id", userId)
       .maybeSingle();
     if (error) throw error;
     return data || undefined;
   }
 
-  async saveSubscription(queueEntryId: string, chatId: string, messenger: string): Promise<void> {
+  async saveSubscriptionForUser(userId: string, chatId: string, messenger: string): Promise<void> {
     const { error } = await db
       .from("users_subscriptions")
       .upsert(
-        { queue_entry_id: queueEntryId, chat_id: chatId, messenger },
-        { onConflict: "queue_entry_id,messenger" }
+        { user_id: userId, chat_id: chatId, messenger },
+        { onConflict: "user_id,messenger" }
       );
     if (error) throw error;
   }
