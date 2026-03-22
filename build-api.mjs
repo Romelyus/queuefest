@@ -5,7 +5,7 @@ import { writeFileSync, statSync } from 'fs';
 // This resolves ERR_MODULE_NOT_FOUND on Vercel's serverless runtime
 // where @vercel/node can't trace relative TypeScript imports
 const result = await esbuild.build({
-  entryPoints: ['api/index.ts'],
+  entryPoints: ['api/index.src.ts'],
   bundle: true,
   platform: 'node',
   target: 'node20',

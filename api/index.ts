@@ -1,9 +1,10 @@
 // @ts-nocheck
-// api/index.ts
+// api/index.src.ts
 import express from "express";
 import { createServer } from "http";
+
+// server/supabase.ts
 import { createClient } from "@supabase/supabase-js";
-import { z } from "zod";
 var supabaseUrl = process.env.SUPABASE_URL || "";
 var supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 if (!supabaseUrl || !supabaseServiceKey) {
@@ -18,6 +19,9 @@ if (!supabaseUrl || !supabaseServiceKey) {
 var supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
   auth: { persistSession: false, autoRefreshToken: false }
 });
+
+// shared/schema.ts
+import { z } from "zod";
 var UserRole = {
   USER: "user",
   MANAGER: "manager",
@@ -65,7 +69,8 @@ function toGameTable(row) {
     gameName: row.game_name,
     status: row.status,
     currentSessionStart: row.current_session_start,
-    qrCode: row.qr_code
+    qrCode: row.qr_code,
+    maxParallelGames: row.max_parallel_games ?? 1
   };
 }
 function toQueueEntry(row) {
@@ -80,7 +85,8 @@ function toQueueEntry(row) {
     notifiedAt: row.notified_at,
     confirmedAt: row.confirmed_at,
     completedAt: row.completed_at,
-    confirmDeadline: row.confirm_deadline
+    confirmDeadline: row.confirm_deadline,
+    walkDeadline: row.walk_deadline
   };
 }
 var insertEventSchema = z.object({
@@ -90,7 +96,8 @@ var insertEventSchema = z.object({
 var insertTableSchema = z.object({
   eventId: z.string().min(1),
   tableName: z.string().min(1, "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0441\u0442\u043E\u043B\u0430 \u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u044C\u043D\u043E"),
-  gameName: z.string().min(1, "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0438\u0433\u0440\u044B \u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u044C\u043D\u043E")
+  gameName: z.string().min(1, "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0438\u0433\u0440\u044B \u043E\u0431\u044F\u0437\u0430\u0442\u0435\u043B\u044C\u043D\u043E"),
+  maxParallelGames: z.number().int().min(1).max(10).default(1)
 });
 var loginSchema = z.object({
   braceletId: z.string().min(1, "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 ID \u0431\u0440\u0430\u0441\u043B\u0435\u0442\u0430").regex(/^\d+$/, "ID \u0434\u043E\u043B\u0436\u0435\u043D \u0441\u043E\u0434\u0435\u0440\u0436\u0430\u0442\u044C \u0442\u043E\u043B\u044C\u043A\u043E \u0446\u0438\u0444\u0440\u044B")
@@ -99,6 +106,8 @@ var joinQueueSchema = z.object({
   tableId: z.string().min(1),
   userId: z.string().min(1)
 });
+
+// server/storage.ts
 var db = supabaseAdmin;
 var ACTIVE_STATUSES = [
   QueueEntryStatus.WAITING,
@@ -168,8 +177,9 @@ var SupabaseStorage = class {
       game_name: input.gameName,
       status: TableStatus.FREE,
       current_session_start: null,
-      qr_code: ""
+      qr_code: "",
       // Will be updated after insert with the ID
+      max_parallel_games: input.maxParallelGames ?? 1
     }).select().single();
     if (error) throw error;
     const qrCode = `/join/${data.id}`;
@@ -182,6 +192,7 @@ var SupabaseStorage = class {
     if (updates.gameName !== void 0) dbUpdates.game_name = updates.gameName;
     if (updates.status !== void 0) dbUpdates.status = updates.status;
     if (updates.currentSessionStart !== void 0) dbUpdates.current_session_start = updates.currentSessionStart;
+    if (updates.maxParallelGames !== void 0) dbUpdates.max_parallel_games = updates.maxParallelGames;
     const { data, error } = await db.from("game_tables").update(dbUpdates).eq("id", id).select().maybeSingle();
     if (error) throw error;
     return data ? toGameTable(data) : void 0;
@@ -222,6 +233,11 @@ var SupabaseStorage = class {
     if (error) throw error;
     return (data || []).map(toQueueEntry);
   }
+  async getActiveQueueForTableWithPlaying(tableId) {
+    const { data, error } = await db.from("queue_entries").select("*").eq("table_id", tableId).in("status", ACTIVE_STATUSES_WITH_PLAYING).order("position", { ascending: true });
+    if (error) throw error;
+    return (data || []).map(toQueueEntry);
+  }
   async getUserQueues(userId) {
     const { data, error } = await db.from("queue_entries").select("*, game_tables(*)").eq("user_id", userId).in("status", ACTIVE_STATUSES_WITH_PLAYING).order("joined_at", { ascending: true });
     if (error) throw error;
@@ -243,7 +259,8 @@ var SupabaseStorage = class {
       notified_at: null,
       confirmed_at: null,
       completed_at: null,
-      confirm_deadline: null
+      confirm_deadline: null,
+      walk_deadline: null
     }).select().single();
     if (error) throw error;
     return toQueueEntry(data);
@@ -269,6 +286,7 @@ var SupabaseStorage = class {
     if (updates.confirmedAt !== void 0) dbUpdates.confirmed_at = updates.confirmedAt;
     if (updates.completedAt !== void 0) dbUpdates.completed_at = updates.completedAt;
     if (updates.confirmDeadline !== void 0) dbUpdates.confirm_deadline = updates.confirmDeadline;
+    if (updates.walkDeadline !== void 0) dbUpdates.walk_deadline = updates.walkDeadline;
     const { data, error } = await db.from("queue_entries").update(dbUpdates).eq("id", id).select().maybeSingle();
     if (error) throw error;
     return data ? toQueueEntry(data) : void 0;
@@ -293,16 +311,16 @@ var SupabaseStorage = class {
     if (error) throw error;
     return data ? toQueueEntry(data) : void 0;
   }
-  // ============ Subscriptions ============
-  async getSubscription(queueEntryId) {
-    const { data, error } = await db.from("users_subscriptions").select("chat_id, messenger").eq("queue_entry_id", queueEntryId).maybeSingle();
+  // ============ Subscriptions (per-user) ============
+  async getSubscriptionByUserId(userId) {
+    const { data, error } = await db.from("users_subscriptions").select("chat_id, messenger").eq("user_id", userId).maybeSingle();
     if (error) throw error;
     return data || void 0;
   }
-  async saveSubscription(queueEntryId, chatId, messenger) {
+  async saveSubscriptionForUser(userId, chatId, messenger) {
     const { error } = await db.from("users_subscriptions").upsert(
-      { queue_entry_id: queueEntryId, chat_id: chatId, messenger },
-      { onConflict: "queue_entry_id,messenger" }
+      { user_id: userId, chat_id: chatId, messenger },
+      { onConflict: "user_id,messenger" }
     );
     if (error) throw error;
   }
@@ -355,6 +373,8 @@ var SupabaseStorage = class {
   }
 };
 var storage = new SupabaseStorage();
+
+// server/log.ts
 function log(message, source = "express") {
   const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
     hour: "numeric",
@@ -364,6 +384,8 @@ function log(message, source = "express") {
   });
   console.log(`${formattedTime} [${source}] ${message}`);
 }
+
+// server/routes.ts
 var BOT_TOKEN = process.env.BOT_TOKEN || "";
 async function sendTelegramMessage(chatId, text) {
   if (!BOT_TOKEN) {
@@ -388,47 +410,106 @@ async function sendTelegramMessage(chatId, text) {
   }
 }
 var CONFIRM_TIMEOUT_MS = 3 * 60 * 1e3;
+var WALK_TIMEOUT_MS = 3 * 60 * 1e3;
 var confirmTimers = /* @__PURE__ */ new Map();
+var walkTimers = /* @__PURE__ */ new Map();
 async function notifyNextInQueue(tableId) {
-  const next = await storage.getNextInQueue(tableId);
-  if (!next) return;
-  const deadline = new Date(Date.now() + CONFIRM_TIMEOUT_MS).toISOString();
-  await storage.updateQueueEntry(next.id, {
-    status: QueueEntryStatus.NOTIFIED,
-    notifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    confirmDeadline: deadline
-  });
-  const sub = await storage.getSubscription(next.id);
-  if (sub?.chat_id) {
-    const table = await storage.getTable(next.tableId);
-    const gameName = table?.gameName || "\u0438\u0433\u0440\u0430";
-    const tableName = table?.tableName || "\u0441\u0442\u043E\u043B";
-    await sendTelegramMessage(
-      sub.chat_id,
-      `\u{1F3B2} <b>\u0412\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043F\u043E\u0434\u043E\u0448\u043B\u0430!</b>
+  const table = await storage.getTable(tableId);
+  if (!table) return;
+  const maxSlots = table.maxParallelGames || 1;
+  const allQueue = await storage.getActiveQueueForTableWithPlaying(tableId);
+  const playingCount = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+  const confirmedCount = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+  const notifiedCount = allQueue.filter((e) => e.status === QueueEntryStatus.NOTIFIED).length;
+  const occupiedSlots = playingCount + confirmedCount + notifiedCount;
+  const availableSlots = maxSlots - occupiedSlots;
+  if (availableSlots <= 0) return;
+  const waiting = allQueue.filter((e) => e.status === QueueEntryStatus.WAITING);
+  const toNotify = waiting.slice(0, availableSlots);
+  for (const next of toNotify) {
+    const deadline = new Date(Date.now() + CONFIRM_TIMEOUT_MS).toISOString();
+    await storage.updateQueueEntry(next.id, {
+      status: QueueEntryStatus.NOTIFIED,
+      notifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      confirmDeadline: deadline
+    });
+    const sub = await storage.getSubscriptionByUserId(next.userId);
+    if (sub?.chat_id) {
+      const gameName = table.gameName || "\u0438\u0433\u0440\u0430";
+      const tableName = table.tableName || "\u0441\u0442\u043E\u043B";
+      await sendTelegramMessage(
+        sub.chat_id,
+        `\u{1F3B2} <b>\u0412\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043F\u043E\u0434\u043E\u0448\u043B\u0430!</b>
 
 \u0418\u0433\u0440\u0430: ${gameName}
 \u0421\u0442\u043E\u043B: ${tableName}
 
 \u041F\u043E\u0434\u043E\u0439\u0434\u0438\u0442\u0435 \u043A \u0441\u0442\u043E\u043B\u0443 \u0432 \u0442\u0435\u0447\u0435\u043D\u0438\u0435 3 \u043C\u0438\u043D\u0443\u0442.`
-    );
-  }
-  const timer = setTimeout(async () => {
-    const entry = await storage.getQueueEntry(next.id);
-    if (entry && entry.status === QueueEntryStatus.NOTIFIED) {
-      await storage.updateQueueEntry(next.id, {
-        status: QueueEntryStatus.EXPIRED,
-        completedAt: (/* @__PURE__ */ new Date()).toISOString()
-      });
-      const active = await storage.getActiveQueueForTable(tableId);
-      for (let i = 0; i < active.length; i++) {
-        await storage.updateQueueEntry(active[i].id, { position: i + 1 });
-      }
-      await notifyNextInQueue(tableId);
+      );
     }
-    confirmTimers.delete(next.id);
-  }, CONFIRM_TIMEOUT_MS);
-  confirmTimers.set(next.id, timer);
+    const timer = setTimeout(async () => {
+      try {
+        const entry = await storage.getQueueEntry(next.id);
+        if (entry && entry.status === QueueEntryStatus.NOTIFIED) {
+          await storage.updateQueueEntry(next.id, {
+            status: QueueEntryStatus.EXPIRED,
+            completedAt: (/* @__PURE__ */ new Date()).toISOString()
+          });
+          const active = await storage.getActiveQueueForTable(tableId);
+          for (let i = 0; i < active.length; i++) {
+            await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+          }
+          await notifyNextInQueue(tableId);
+        }
+      } catch (err) {
+        log(`Confirm timer error: ${err.message}`);
+      }
+      confirmTimers.delete(next.id);
+    }, CONFIRM_TIMEOUT_MS);
+    confirmTimers.set(next.id, timer);
+  }
+}
+function startWalkTimer(entryId, tableId) {
+  const timer = setTimeout(async () => {
+    try {
+      const entry = await storage.getQueueEntry(entryId);
+      if (entry && entry.status === QueueEntryStatus.CONFIRMED) {
+        await storage.updateQueueEntry(entryId, {
+          status: QueueEntryStatus.EXPIRED,
+          completedAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        const sub = await storage.getSubscriptionByUserId(entry.userId);
+        if (sub?.chat_id) {
+          await sendTelegramMessage(
+            sub.chat_id,
+            `\u23F0 <b>\u0412\u0440\u0435\u043C\u044F \u0438\u0441\u0442\u0435\u043A\u043B\u043E</b>
+
+\u0412\u044B \u043D\u0435 \u0443\u0441\u043F\u0435\u043B\u0438 \u043F\u043E\u0434\u043E\u0439\u0442\u0438 \u043A \u0441\u0442\u043E\u043B\u0443 \u0437\u0430 3 \u043C\u0438\u043D\u0443\u0442\u044B.
+\u0417\u0430\u043F\u0438\u0448\u0438\u0442\u0435\u0441\u044C \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u0441\u043D\u043E\u0432\u0430 \u0447\u0435\u0440\u0435\u0437 QR-\u043A\u043E\u0434.`
+          );
+        }
+        const active = await storage.getActiveQueueForTable(tableId);
+        for (let i = 0; i < active.length; i++) {
+          await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+        }
+        const allQueue = await storage.getActiveQueueForTableWithPlaying(tableId);
+        const stillPlaying = allQueue.filter(
+          (e) => e.status === QueueEntryStatus.PLAYING || e.status === QueueEntryStatus.CONFIRMED
+        ).length;
+        if (stillPlaying === 0) {
+          await storage.updateTable(tableId, {
+            status: TableStatus.FREE,
+            currentSessionStart: null
+          });
+        }
+        await notifyNextInQueue(tableId);
+      }
+    } catch (err) {
+      log(`Walk timer error: ${err.message}`);
+    }
+    walkTimers.delete(entryId);
+  }, WALK_TIMEOUT_MS);
+  walkTimers.set(entryId, timer);
 }
 async function registerRoutes(httpServer2, app2) {
   app2.post("/api/auth/login", async (req, res) => {
@@ -526,7 +607,7 @@ async function registerRoutes(httpServer2, app2) {
     const tables = await storage.getTables(req.params.eventId);
     const tablesWithQueue = await Promise.all(
       tables.map(async (t) => {
-        const queue = await storage.getActiveQueueForTable(t.id);
+        const queue = await storage.getActiveQueueForTableWithPlaying(t.id);
         return { ...t, queueLength: queue.length, queue };
       })
     );
@@ -535,7 +616,7 @@ async function registerRoutes(httpServer2, app2) {
   app2.get("/api/tables/:id", async (req, res) => {
     const table = await storage.getTable(req.params.id);
     if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-    const queue = await storage.getActiveQueueForTable(table.id);
+    const queue = await storage.getActiveQueueForTableWithPlaying(table.id);
     res.json({ ...table, queueLength: queue.length, queue });
   });
   app2.post("/api/tables", async (req, res) => {
@@ -548,7 +629,13 @@ async function registerRoutes(httpServer2, app2) {
     }
   });
   app2.patch("/api/tables/:id", async (req, res) => {
-    const table = await storage.updateTable(req.params.id, req.body);
+    const updates = {};
+    if (req.body.tableName !== void 0) updates.tableName = req.body.tableName;
+    if (req.body.gameName !== void 0) updates.gameName = req.body.gameName;
+    if (req.body.maxParallelGames !== void 0) updates.maxParallelGames = Number(req.body.maxParallelGames);
+    if (req.body.status !== void 0) updates.status = req.body.status;
+    if (req.body.currentSessionStart !== void 0) updates.currentSessionStart = req.body.currentSessionStart;
+    const table = await storage.updateTable(req.params.id, updates);
     if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
     res.json(table);
   });
@@ -558,7 +645,7 @@ async function registerRoutes(httpServer2, app2) {
     res.json({ success: true });
   });
   app2.get("/api/tables/:tableId/queue", async (req, res) => {
-    const queue = await storage.getActiveQueueForTable(req.params.tableId);
+    const queue = await storage.getActiveQueueForTableWithPlaying(req.params.tableId);
     const enriched = await Promise.all(
       queue.map(async (e) => {
         const user = await storage.getUser(e.userId);
@@ -571,6 +658,10 @@ async function registerRoutes(httpServer2, app2) {
     const queues = await storage.getUserQueues(req.params.userId);
     res.json(queues);
   });
+  app2.get("/api/users/:userId/subscription", async (req, res) => {
+    const sub = await storage.getSubscriptionByUserId(req.params.userId);
+    res.json(sub || null);
+  });
   app2.post("/api/queue/join", async (req, res) => {
     try {
       const data = joinQueueSchema.parse(req.body);
@@ -582,7 +673,13 @@ async function registerRoutes(httpServer2, app2) {
       if (alreadyInQueue)
         return res.status(400).json({ message: "\u0412\u044B \u0443\u0436\u0435 \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438 \u043D\u0430 \u044D\u0442\u043E\u0442 \u0441\u0442\u043E\u043B" });
       const entry = await storage.addToQueue(data.tableId, data.userId, table.eventId);
-      if (table.status === TableStatus.FREE && entry.position === 1) {
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(data.tableId);
+      const playingCount = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const notifiedCount = allQueue.filter((e) => e.status === QueueEntryStatus.NOTIFIED).length;
+      const confirmedCount = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      const maxSlots = table.maxParallelGames || 1;
+      const hasAvailableSlot = playingCount + notifiedCount + confirmedCount < maxSlots;
+      if (hasAvailableSlot && entry.position === 1) {
         await notifyNextInQueue(data.tableId);
       }
       res.status(201).json(entry);
@@ -591,96 +688,224 @@ async function registerRoutes(httpServer2, app2) {
     }
   });
   app2.post("/api/queue/:entryId/confirm", async (req, res) => {
-    const entry = await storage.getQueueEntry(req.params.entryId);
-    if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
-    if (entry.status !== QueueEntryStatus.NOTIFIED) {
-      return res.status(400).json({ message: "\u041F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u0438\u0435 \u043D\u0435\u0432\u043E\u0437\u043C\u043E\u0436\u043D\u043E \u0432 \u0442\u0435\u043A\u0443\u0449\u0435\u043C \u0441\u0442\u0430\u0442\u0443\u0441\u0435" });
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+      if (entry.status !== QueueEntryStatus.NOTIFIED) {
+        return res.status(400).json({ message: "\u041F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u0438\u0435 \u043D\u0435\u0432\u043E\u0437\u043C\u043E\u0436\u043D\u043E \u0432 \u0442\u0435\u043A\u0443\u0449\u0435\u043C \u0441\u0442\u0430\u0442\u0443\u0441\u0435" });
+      }
+      const timer = confirmTimers.get(entry.id);
+      if (timer) {
+        clearTimeout(timer);
+        confirmTimers.delete(entry.id);
+      }
+      const walkDeadline = new Date(Date.now() + WALK_TIMEOUT_MS).toISOString();
+      const updated = await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.CONFIRMED,
+        confirmedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        walkDeadline
+      });
+      startWalkTimer(entry.id, entry.tableId);
+      res.json(updated);
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    const timer = confirmTimers.get(entry.id);
-    if (timer) {
-      clearTimeout(timer);
-      confirmTimers.delete(entry.id);
-    }
-    const updated = await storage.updateQueueEntry(entry.id, {
-      status: QueueEntryStatus.CONFIRMED,
-      confirmedAt: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    res.json(updated);
   });
   app2.post("/api/queue/:entryId/cancel", async (req, res) => {
-    const entry = await storage.getQueueEntry(req.params.entryId);
-    if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
-    const timer = confirmTimers.get(entry.id);
-    if (timer) {
-      clearTimeout(timer);
-      confirmTimers.delete(entry.id);
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+      const cTimer = confirmTimers.get(entry.id);
+      if (cTimer) {
+        clearTimeout(cTimer);
+        confirmTimers.delete(entry.id);
+      }
+      const wTimer = walkTimers.get(entry.id);
+      if (wTimer) {
+        clearTimeout(wTimer);
+        walkTimers.delete(entry.id);
+      }
+      const ok = await storage.removeFromQueue(entry.id);
+      if (!ok) return res.status(400).json({ message: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u0442\u043C\u0435\u043D\u0438\u0442\u044C" });
+      await notifyNextInQueue(entry.tableId);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    const ok = await storage.removeFromQueue(entry.id);
-    if (!ok) return res.status(400).json({ message: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u0442\u043C\u0435\u043D\u0438\u0442\u044C" });
-    res.json({ success: true });
   });
-  app2.post("/api/tables/:tableId/start-session", async (req, res) => {
-    const table = await storage.getTable(req.params.tableId);
-    if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-    const queue = await storage.getActiveQueueForTable(table.id);
-    const playingCount = queue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
-    if (playingCount >= 2) {
-      return res.status(400).json({ message: "\u041C\u0430\u043A\u0441\u0438\u043C\u0443\u043C 2 \u043F\u0430\u0440\u0430\u043B\u043B\u0435\u043B\u044C\u043D\u044B\u0445 \u043F\u0430\u0440\u0442\u0438\u0438 \u043D\u0430 \u0441\u0442\u043E\u043B\u0435" });
-    }
-    await storage.updateTable(table.id, {
-      status: TableStatus.PLAYING,
-      currentSessionStart: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    const confirmed = queue.find((e) => e.status === QueueEntryStatus.CONFIRMED);
-    if (confirmed) {
-      await storage.updateQueueEntry(confirmed.id, {
-        status: QueueEntryStatus.PLAYING
+  app2.post("/api/queue/:entryId/start-playing", async (req, res) => {
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+      if (entry.status !== QueueEntryStatus.CONFIRMED) {
+        return res.status(400).json({ message: "\u041D\u0430\u0447\u0430\u0442\u044C \u0438\u0433\u0440\u0443 \u043C\u043E\u0436\u043D\u043E \u0442\u043E\u043B\u044C\u043A\u043E \u0438\u0437 \u0441\u0442\u0430\u0442\u0443\u0441\u0430 '\u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u043E'" });
+      }
+      const wTimer = walkTimers.get(entry.id);
+      if (wTimer) {
+        clearTimeout(wTimer);
+        walkTimers.delete(entry.id);
+      }
+      await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.PLAYING,
+        walkDeadline: null
       });
+      await storage.updateTable(entry.tableId, {
+        status: TableStatus.PLAYING,
+        currentSessionStart: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    res.json({ success: true });
   });
-  app2.post("/api/tables/:tableId/end-session", async (req, res) => {
-    const table = await storage.getTable(req.params.tableId);
-    if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-    const queue = await storage.getActiveQueueForTable(table.id);
-    const playing = queue.filter((e) => e.status === QueueEntryStatus.PLAYING);
-    for (const p of playing) {
-      await storage.updateQueueEntry(p.id, {
+  app2.post("/api/queue/:entryId/finish-playing", async (req, res) => {
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+      if (entry.status !== QueueEntryStatus.PLAYING) {
+        return res.status(400).json({ message: "\u0417\u0430\u0432\u0435\u0440\u0448\u0438\u0442\u044C \u043C\u043E\u0436\u043D\u043E \u0442\u043E\u043B\u044C\u043A\u043E \u0430\u043A\u0442\u0438\u0432\u043D\u0443\u044E \u043F\u0430\u0440\u0442\u0438\u044E" });
+      }
+      await storage.updateQueueEntry(entry.id, {
         status: QueueEntryStatus.COMPLETED,
         completedAt: (/* @__PURE__ */ new Date()).toISOString()
       });
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(entry.tableId);
+      const stillPlaying = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const stillConfirmed = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      if (stillPlaying === 0 && stillConfirmed === 0) {
+        await storage.updateTable(entry.tableId, {
+          status: TableStatus.FREE,
+          currentSessionStart: null
+        });
+      }
+      const remaining = await storage.getActiveQueueForTable(entry.tableId);
+      for (let i = 0; i < remaining.length; i++) {
+        await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+      }
+      await notifyNextInQueue(entry.tableId);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    const remainingQueue = await storage.getActiveQueueForTable(table.id);
-    const stillPlaying = remainingQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
-    if (stillPlaying === 0) {
+  });
+  app2.post("/api/tables/:tableId/start-session", async (req, res) => {
+    try {
+      const table = await storage.getTable(req.params.tableId);
+      if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+      const maxSlots = table.maxParallelGames || 1;
+      const queue = await storage.getActiveQueueForTableWithPlaying(table.id);
+      const playingCount = queue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      if (playingCount >= maxSlots) {
+        return res.status(400).json({ message: `\u041C\u0430\u043A\u0441\u0438\u043C\u0443\u043C ${maxSlots} \u043F\u0430\u0440\u0430\u043B\u043B\u0435\u043B\u044C\u043D\u044B\u0445 \u043F\u0430\u0440\u0442\u0438\u0439 \u043D\u0430 \u0441\u0442\u043E\u043B\u0435` });
+      }
       await storage.updateTable(table.id, {
-        status: TableStatus.FREE,
-        currentSessionStart: null
+        status: TableStatus.PLAYING,
+        currentSessionStart: (/* @__PURE__ */ new Date()).toISOString()
       });
+      const confirmed = queue.find((e) => e.status === QueueEntryStatus.CONFIRMED);
+      if (confirmed) {
+        const wTimer = walkTimers.get(confirmed.id);
+        if (wTimer) {
+          clearTimeout(wTimer);
+          walkTimers.delete(confirmed.id);
+        }
+        await storage.updateQueueEntry(confirmed.id, {
+          status: QueueEntryStatus.PLAYING,
+          walkDeadline: null
+        });
+      }
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    const remaining = await storage.getActiveQueueForTable(table.id);
-    for (let i = 0; i < remaining.length; i++) {
-      await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+  });
+  app2.post("/api/queue/:entryId/end-session", async (req, res) => {
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+      if (entry.status !== QueueEntryStatus.PLAYING) {
+        return res.status(400).json({ message: "\u042D\u0442\u0430 \u043F\u0430\u0440\u0442\u0438\u044F \u043D\u0435 \u0432 \u0441\u0442\u0430\u0442\u0443\u0441\u0435 '\u0438\u0433\u0440\u0430\u0435\u0442'" });
+      }
+      await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.COMPLETED,
+        completedAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(entry.tableId);
+      const stillPlaying = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const stillConfirmed = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      if (stillPlaying === 0 && stillConfirmed === 0) {
+        await storage.updateTable(entry.tableId, {
+          status: TableStatus.FREE,
+          currentSessionStart: null
+        });
+      }
+      const remaining = await storage.getActiveQueueForTable(entry.tableId);
+      for (let i = 0; i < remaining.length; i++) {
+        await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+      }
+      await notifyNextInQueue(entry.tableId);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    await notifyNextInQueue(table.id);
-    res.json({ success: true });
+  });
+  app2.post("/api/tables/:tableId/end-session", async (req, res) => {
+    try {
+      const table = await storage.getTable(req.params.tableId);
+      if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+      const queue = await storage.getActiveQueueForTableWithPlaying(table.id);
+      const playing = queue.filter((e) => e.status === QueueEntryStatus.PLAYING);
+      for (const p of playing) {
+        await storage.updateQueueEntry(p.id, {
+          status: QueueEntryStatus.COMPLETED,
+          completedAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+      const remainingQueue = await storage.getActiveQueueForTableWithPlaying(table.id);
+      const stillPlaying = remainingQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const stillConfirmed = remainingQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      if (stillPlaying === 0 && stillConfirmed === 0) {
+        await storage.updateTable(table.id, {
+          status: TableStatus.FREE,
+          currentSessionStart: null
+        });
+      }
+      const remaining = await storage.getActiveQueueForTable(table.id);
+      for (let i = 0; i < remaining.length; i++) {
+        await storage.updateQueueEntry(remaining[i].id, { position: i + 1 });
+      }
+      await notifyNextInQueue(table.id);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
+    }
   });
   app2.post("/api/queue/force-add", async (req, res) => {
-    const { tableId, braceletId } = req.body;
-    const table = await storage.getTable(tableId);
-    if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
-    const eventId = table.eventId;
-    let user = await storage.getUserByBracelet(braceletId, eventId);
-    if (!user) {
-      user = await storage.createUser(braceletId, `\u0413\u043E\u0441\u0442\u044C ${braceletId}`, UserRole.USER, eventId);
+    try {
+      const { tableId, braceletId } = req.body;
+      const table = await storage.getTable(tableId);
+      if (!table) return res.status(404).json({ message: "\u0421\u0442\u043E\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D" });
+      const eventId = table.eventId;
+      let user = await storage.getUserByBracelet(braceletId, eventId);
+      if (!user) {
+        user = await storage.createUser(braceletId, `\u0413\u043E\u0441\u0442\u044C ${braceletId}`, UserRole.USER, eventId);
+      }
+      const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
+      if (alreadyInQueue) return res.status(400).json({ message: "\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C \u0443\u0436\u0435 \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438" });
+      const entry = await storage.addToQueue(tableId, user.id, eventId);
+      const allQueue = await storage.getActiveQueueForTableWithPlaying(tableId);
+      const playingCount = allQueue.filter((e) => e.status === QueueEntryStatus.PLAYING).length;
+      const notifiedCount = allQueue.filter((e) => e.status === QueueEntryStatus.NOTIFIED).length;
+      const confirmedCount = allQueue.filter((e) => e.status === QueueEntryStatus.CONFIRMED).length;
+      const maxSlots = table.maxParallelGames || 1;
+      const hasAvailableSlot = playingCount + notifiedCount + confirmedCount < maxSlots;
+      if (hasAvailableSlot && entry.position === 1) {
+        await notifyNextInQueue(tableId);
+      }
+      res.status(201).json(entry);
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    const alreadyInQueue = await storage.isUserInQueue(user.id, tableId);
-    if (alreadyInQueue) return res.status(400).json({ message: "\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C \u0443\u0436\u0435 \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438" });
-    const entry = await storage.addToQueue(tableId, user.id, eventId);
-    if (table.status === TableStatus.FREE && entry.position === 1) {
-      await notifyNextInQueue(tableId);
-    }
-    res.status(201).json(entry);
   });
   app2.post("/api/tables/:tableId/reorder", async (req, res) => {
     const { entryIds } = req.body;
@@ -689,22 +914,32 @@ async function registerRoutes(httpServer2, app2) {
     res.json({ success: true });
   });
   app2.post("/api/queue/:entryId/skip", async (req, res) => {
-    const entry = await storage.getQueueEntry(req.params.entryId);
-    if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
-    const timer = confirmTimers.get(entry.id);
-    if (timer) {
-      clearTimeout(timer);
-      confirmTimers.delete(entry.id);
+    try {
+      const entry = await storage.getQueueEntry(req.params.entryId);
+      if (!entry) return res.status(404).json({ message: "\u0417\u0430\u043F\u0438\u0441\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430" });
+      const cTimer = confirmTimers.get(entry.id);
+      if (cTimer) {
+        clearTimeout(cTimer);
+        confirmTimers.delete(entry.id);
+      }
+      const wTimer = walkTimers.get(entry.id);
+      if (wTimer) {
+        clearTimeout(wTimer);
+        walkTimers.delete(entry.id);
+      }
+      await storage.updateQueueEntry(entry.id, {
+        status: QueueEntryStatus.SKIPPED,
+        completedAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      const active = await storage.getActiveQueueForTable(entry.tableId);
+      for (let i = 0; i < active.length; i++) {
+        await storage.updateQueueEntry(active[i].id, { position: i + 1 });
+      }
+      await notifyNextInQueue(entry.tableId);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
-    await storage.updateQueueEntry(entry.id, {
-      status: QueueEntryStatus.SKIPPED,
-      completedAt: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    const active = await storage.getActiveQueueForTable(entry.tableId);
-    for (let i = 0; i < active.length; i++) {
-      await storage.updateQueueEntry(active[i].id, { position: i + 1 });
-    }
-    res.json({ success: true });
   });
   app2.get("/api/events/:eventId/analytics", async (req, res) => {
     const analytics = await storage.getAnalytics(req.params.eventId);
@@ -755,23 +990,23 @@ async function registerRoutes(httpServer2, app2) {
       const text = message.text.trim();
       if (text.startsWith("/start")) {
         const parts = text.split(" ");
-        if (parts.length >= 2 && parts[1].startsWith("queue_")) {
-          const queueEntryId = parts[1].replace("queue_", "");
-          const entry = await storage.getQueueEntry(queueEntryId);
-          if (entry) {
-            await storage.saveSubscription(queueEntryId, chatId, "telegram");
+        if (parts.length >= 2 && parts[1].startsWith("user_")) {
+          const userId = parts[1].replace("user_", "");
+          const user = await storage.getUser(userId);
+          if (user) {
+            await storage.saveSubscriptionForUser(userId, chatId, "telegram");
             await sendTelegramMessage(
               chatId,
               `\u2705 <b>\u0423\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u044B!</b>
 
-\u0412\u044B \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435, \u043A\u043E\u0433\u0434\u0430 \u043F\u043E\u0434\u043E\u0439\u0434\u0451\u0442 \u0432\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C.
+\u0412\u044B \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435, \u043A\u043E\u0433\u0434\u0430 \u043F\u043E\u0434\u043E\u0439\u0434\u0451\u0442 \u0432\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043D\u0430 \u043B\u044E\u0431\u043E\u0439 \u0438\u0437 \u0441\u0442\u043E\u043B\u043E\u0432.
 
 \u{1F3B2} \u0423\u0434\u0430\u0447\u043D\u043E\u0439 \u0438\u0433\u0440\u044B \u043D\u0430 \u0444\u0435\u0441\u0442\u0438\u0432\u0430\u043B\u0435!`
             );
           } else {
             await sendTelegramMessage(
               chatId,
-              `\u274C \u0417\u0430\u043F\u0438\u0441\u044C \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u0438 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430. \u041F\u043E\u043F\u0440\u043E\u0431\u0443\u0439\u0442\u0435 \u0437\u0430\u043F\u0438\u0441\u0430\u0442\u044C\u0441\u044F \u0437\u0430\u043D\u043E\u0432\u043E \u0447\u0435\u0440\u0435\u0437 QR-\u043A\u043E\u0434 \u043D\u0430 \u0441\u0442\u043E\u043B\u0435.`
+              `\u274C \u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D. \u041F\u043E\u043F\u0440\u043E\u0431\u0443\u0439\u0442\u0435 \u0432\u043E\u0439\u0442\u0438 \u0447\u0435\u0440\u0435\u0437 \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u0435 \u0438 \u043D\u0430\u0436\u0430\u0442\u044C \u043A\u043D\u043E\u043F\u043A\u0443 \xABTelegram\xBB.`
             );
           }
         } else {
@@ -781,7 +1016,7 @@ async function registerRoutes(httpServer2, app2) {
 
 \u042F \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u044E \u0432\u0430\u0441, \u043A\u043E\u0433\u0434\u0430 \u043F\u043E\u0434\u043E\u0439\u0434\u0451\u0442 \u0432\u0430\u0448\u0430 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043D\u0430 \u0444\u0435\u0441\u0442\u0438\u0432\u0430\u043B\u0435 \u043D\u0430\u0441\u0442\u043E\u043B\u044C\u043D\u044B\u0445 \u0438\u0433\u0440.
 
-\u0427\u0442\u043E\u0431\u044B \u043F\u043E\u0434\u043F\u0438\u0441\u0430\u0442\u044C\u0441\u044F, \u0437\u0430\u043F\u0438\u0448\u0438\u0442\u0435\u0441\u044C \u0432 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u0447\u0435\u0440\u0435\u0437 \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u0435 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 \u043A\u043D\u043E\u043F\u043A\u0443 \xAB\u0423\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F \u0432 Telegram\xBB.`
+\u0427\u0442\u043E\u0431\u044B \u043F\u043E\u0434\u043F\u0438\u0441\u0430\u0442\u044C\u0441\u044F, \u0432\u043E\u0439\u0434\u0438\u0442\u0435 \u0432 \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u0435 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 \u043A\u043D\u043E\u043F\u043A\u0443 \xAB\u0423\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F \u0432 Telegram\xBB.`
           );
         }
       }
@@ -796,6 +1031,8 @@ async function registerRoutes(httpServer2, app2) {
   });
   return httpServer2;
 }
+
+// api/index.src.ts
 var app = express();
 var httpServer = createServer(app);
 app.use(express.json());
@@ -808,7 +1045,7 @@ app.use((err, _req, res, next) => {
   if (res.headersSent) return next(err);
   return res.status(status).json({ message });
 });
-var index_default = app;
+var index_src_default = app;
 export {
-  index_default as default
+  index_src_default as default
 };
