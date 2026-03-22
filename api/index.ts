@@ -1,3 +1,4 @@
+// @ts-nocheck
 // api/index.ts
 import express from "express";
 import { createServer } from "http";
@@ -7,8 +8,12 @@ import { createClient } from "@supabase/supabase-js";
 var supabaseUrl = process.env.SUPABASE_URL || "";
 var supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 if (!supabaseUrl || !supabaseServiceKey) {
-  console.warn(
-    "\u26A0\uFE0F  SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Database operations will fail."
+  console.error(
+    "\u274C SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set!",
+    "SUPABASE_URL length:",
+    supabaseUrl.length,
+    "KEY length:",
+    supabaseServiceKey.length
   );
 }
 var supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
@@ -458,23 +463,26 @@ async function registerRoutes(httpServer2, app2) {
     }
   });
   app2.post("/api/auth/admin-login", async (req, res) => {
-    const { password } = req.body;
-    const activeEvent = await storage.getActiveEvent();
-    const eventId = activeEvent?.id || "global";
-    if (password === "admin2026") {
-      let user = await storage.getUserByBracelet("ADMIN", eventId);
+    try {
+      const { password } = req.body;
+      if (password !== "admin2026" && password !== "manager2026") {
+        return res.status(401).json({ message: "\u041D\u0435\u0432\u0435\u0440\u043D\u044B\u0439 \u043F\u0430\u0440\u043E\u043B\u044C" });
+      }
+      const role = password === "admin2026" ? UserRole.ADMIN : UserRole.MANAGER;
+      const braceletId = password === "admin2026" ? "ADMIN" : "MANAGER";
+      const name = password === "admin2026" ? "\u0410\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440" : "\u041C\u0435\u043D\u0435\u0434\u0436\u0435\u0440";
+      let activeEvent = await storage.getActiveEvent();
+      if (!activeEvent) {
+        activeEvent = await storage.createEvent({ name: "\u0424\u0435\u0441\u0442\u0438\u0432\u0430\u043B\u044C", description: "" });
+        await storage.activateEvent(activeEvent.id);
+      }
+      let user = await storage.getUserByBracelet(braceletId, activeEvent.id);
       if (!user) {
-        user = await storage.createUser("ADMIN", "\u0410\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440", UserRole.ADMIN, eventId);
+        user = await storage.createUser(braceletId, name, role, activeEvent.id);
       }
       res.json(user);
-    } else if (password === "manager2026") {
-      let user = await storage.getUserByBracelet("MANAGER", eventId);
-      if (!user) {
-        user = await storage.createUser("MANAGER", "\u041C\u0435\u043D\u0435\u0434\u0436\u0435\u0440", UserRole.MANAGER, eventId);
-      }
-      res.json(user);
-    } else {
-      res.status(401).json({ message: "\u041D\u0435\u0432\u0435\u0440\u043D\u044B\u0439 \u043F\u0430\u0440\u043E\u043B\u044C" });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
     }
   });
   app2.get("/api/auth/user/:id", async (req, res) => {

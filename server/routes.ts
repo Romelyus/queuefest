@@ -115,23 +115,31 @@ export async function registerRoutes(
   });
 
   app.post("/api/auth/admin-login", async (req, res) => {
-    const { password } = req.body;
-    const activeEvent = await storage.getActiveEvent();
-    const eventId = activeEvent?.id || "global";
-    if (password === "admin2026") {
-      let user = await storage.getUserByBracelet("ADMIN", eventId);
+    try {
+      const { password } = req.body;
+      if (password !== "admin2026" && password !== "manager2026") {
+        return res.status(401).json({ message: "Неверный пароль" });
+      }
+
+      const role = password === "admin2026" ? UserRole.ADMIN : UserRole.MANAGER;
+      const braceletId = password === "admin2026" ? "ADMIN" : "MANAGER";
+      const name = password === "admin2026" ? "Администратор" : "Менеджер";
+
+      // Admin/manager need an event context for the FK constraint.
+      // Try active event first; if none, create a bootstrap event.
+      let activeEvent = await storage.getActiveEvent();
+      if (!activeEvent) {
+        activeEvent = await storage.createEvent({ name: "Фестиваль", description: "" });
+        await storage.activateEvent(activeEvent.id);
+      }
+
+      let user = await storage.getUserByBracelet(braceletId, activeEvent.id);
       if (!user) {
-        user = await storage.createUser("ADMIN", "Администратор", UserRole.ADMIN, eventId);
+        user = await storage.createUser(braceletId, name, role, activeEvent.id);
       }
       res.json(user);
-    } else if (password === "manager2026") {
-      let user = await storage.getUserByBracelet("MANAGER", eventId);
-      if (!user) {
-        user = await storage.createUser("MANAGER", "Менеджер", UserRole.MANAGER, eventId);
-      }
-      res.json(user);
-    } else {
-      res.status(401).json({ message: "Неверный пароль" });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
     }
   });
 

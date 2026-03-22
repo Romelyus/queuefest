@@ -14,9 +14,11 @@ const result = await esbuild.build({
   packages: 'external',
 });
 
-// Overwrite the .ts file with bundled JS (valid JS is valid TS)
+// Overwrite the .ts file with bundled JS
 // Vercel pre-registers api/index.ts before build, so it must still exist
-writeFileSync('api/index.ts', result.outputFiles[0].text);
+// Prepend @ts-nocheck so Vercel's TS compiler doesn't fail on untyped params
+const bundled = '// @ts-nocheck\n' + result.outputFiles[0].text;
+writeFileSync('api/index.ts', bundled);
 
 const size = Math.round(result.outputFiles[0].text.length / 1024);
 console.log(`\u2713 api/index.ts bundled (${size}kb)`);

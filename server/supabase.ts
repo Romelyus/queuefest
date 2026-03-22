@@ -6,8 +6,10 @@ const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  console.warn(
-    "⚠️  SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Database operations will fail."
+  console.error(
+    "❌ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set!",
+    "SUPABASE_URL length:", supabaseUrl.length,
+    "KEY length:", supabaseServiceKey.length
   );
 }
 
